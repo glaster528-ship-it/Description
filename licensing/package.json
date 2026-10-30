@@ -1,0 +1,20 @@
+{
+  "name": "device-license-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone key and device-bound licensing API with a same-origin web client",
+  "engines": { "node": ">=24 <25" },
+  "scripts": {
+    "configure": "node scripts/init-env.js",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "license": "node --env-file-if-exists=.env src/license-cli.js",
+    "test": "node --test",
+    "check": "node --check public/app.js && node --test"
+  },
+  "dependencies": {
+    "express": "5.3.0",
+    "express-rate-limit": "8.7.2",
+    "helmet": "8.3.0"
+  }
+}
