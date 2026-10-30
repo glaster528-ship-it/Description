@@ -308,6 +308,14 @@ def ensure_sounds(log):
     place_sound_strips(cues, log)
 
 
+def _set_handle(st, side, frame):
+    name = side + "_handle"
+    if hasattr(st, name):
+        setattr(st, name, frame)
+    else:
+        setattr(st, "frame_final_start" if side == "left" else "frame_final_end", frame)
+
+
 def place_sound_strips(cues, log):
     scene = bpy.context.scene
     se = scene.sequence_editor or scene.sequence_editor_create()
@@ -319,12 +327,16 @@ def place_sound_strips(cues, log):
         path = _abs("//sounds/%s.ogg" % c["sound"])
         if not os.path.isfile(path):
             continue
+        # offset — с какой секунды файла звучать на кадре c["frame"] (подгонка музыки под удары)
+        start = c["frame"] - int(round(c.get("offset", 0.0) * fps))
         st = coll.new_sound("%03d_%s" % (i, c["sound"].replace("/", "_")),
-                            bpy.path.relpath(path), c.get("channel", 2), c["frame"])
+                            bpy.path.relpath(path), c.get("channel", 2), start)
         st["mc_cue"] = 1
         st.volume = c.get("volume", 1.0)
+        if c.get("offset"):
+            _set_handle(st, "left", c["frame"])
         if c.get("duration"):
-            st.frame_final_end = c["frame"] + int(c["duration"] * fps)
+            _set_handle(st, "right", c["frame"] + int(c["duration"] * fps))
         for f, v in c.get("volume_keys", []):
             st.volume = v
             st.keyframe_insert("volume", frame=f)

@@ -1,411 +1,98 @@
-"""Собирает minecraft_sunset.blend с нуля.
+"""«HEROBRINE» — 30-секундная Minecraft-анимация (24 к/с, 2.39:1). Сборка сцены с нуля.
 
 blender -b --factory-startup --python scripts/build_scene.py
 
-Сцена ссылается на текстуры //textures/... и звуки //sounds/..., которые
-подкладывает scripts/mc_assets.py из вашей копии Minecraft 1.21.11.
+Ванильные текстуры/звуки 1.21.11 подкладывает scripts/mc_assets.py (в проект не входят).
 """
 
-import json
 import math
 import os
 import random
+import sys
 
 import bpy
-from mathutils import Matrix, Vector, noise
+from bpy_extras.object_utils import world_to_camera_view
+from mathutils import Matrix, Quaternion, Vector, noise
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import mclib as L  # noqa: E402
+from mclib import (DIRS, MB, NT, PX, UV_FULL, Anim, clamp, face_pts, interp, key_attr, key_prop,  # noqa: E402
+                   key_vis, lerp, link, new_material, rad, rot2, s5, seg, srgb, sstep, tex, v3, yaw_to)
+
 ROOT = os.path.dirname(HERE)
-OUT = os.path.join(ROOT, "minecraft_sunset.blend")
+OUT = os.path.join(ROOT, "minecraft_herobrine.blend")
+FPS, F0, F1 = 24, 1, 720
+R = random.Random(2026)
 
-FPS, F_START, F_END = 24, 1, 720
-PX = 1.0 / 16.0
-R = random.Random(1211)
-rad = math.radians
+# ------------------------------------------------------------------ layout
 
-# --------------------------------------------------------------------------- math
-
-
-def clamp(x, a=0.0, b=1.0):
-    return a if x < a else b if x > b else x
-
-
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-
-def seg(f, a, b):
-    return clamp((f - a) / float(b - a))
-
-
-def s5(t):
-    t = clamp(t)
-    return t * t * t * (t * (t * 6 - 15) + 10)
-
-
-def sstep(t):
-    t = clamp(t)
-    return t * t * (3 - 2 * t)
-
-
-EASE = {
-    "lin": lambda t: t,
-    "io": s5,
-    "in": lambda t: t ** 3,
-    "out": lambda t: 1 - (1 - t) ** 3,
-    "in2": lambda t: t * t,
-    "out2": lambda t: 1 - (1 - t) ** 2,
-    "back": lambda t: 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2,
-    "snap": lambda t: 1 - 2 ** (-10 * t),
-}
-
-
-class Track:
-    """Ключи (кадр, значение, изинг входа в ключ)."""
-
-    def __init__(self, *keys):
-        self.k = []
-        for k in keys:
-            self.add(*k)
-
-    def add(self, f, v, e="io"):
-        self.k = [x for x in self.k if x[0] != f]
-        self.k.append((f, v, e))
-        self.k.sort(key=lambda x: x[0])
-        return self
-
-    def __call__(self, f):
-        k = self.k
-        if not k:
-            return 0.0
-        if f <= k[0][0]:
-            return k[0][1]
-        if f >= k[-1][0]:
-            return k[-1][1]
-        for i in range(len(k) - 1):
-            fa, va, _ = k[i]
-            fb, vb, e = k[i + 1]
-            if fa <= f < fb:
-                return va + (vb - va) * EASE[e]((f - fa) / float(fb - fa))
-        return k[-1][1]
-
-
-def srgb(h):
-    h = h.lstrip("#")
-    c = [int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
-    return tuple(x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c)
-
-
-def yaw_to(dx, dy):
-    """Поворот root вокруг Z, при котором «лицо» (-Y) смотрит в (dx, dy)."""
-    return math.degrees(math.atan2(dx, -dy))
-
-
-def unwrap(prev, ang):
-    while ang - prev > 180:
-        ang -= 360
-    while ang - prev < -180:
-        ang += 360
-    return ang
-
-
-class Path2D:
-    """Сглаженная (Catmull-Rom) ломаная с таблицей длины дуги."""
-
-    def __init__(self, pts, samples=40):
-        P = [Vector((p[0], p[1])) for p in pts]
-        P = [P[0] * 2 - P[1]] + P + [P[-1] * 2 - P[-2]]
-        self.pts = []
-        for i in range(1, len(P) - 2):
-            p0, p1, p2, p3 = P[i - 1], P[i], P[i + 1], P[i + 2]
-            for j in range(samples):
-                t = j / samples
-                t2, t3 = t * t, t * t * t
-                self.pts.append(0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                                       + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
-        self.pts.append(P[-2])
-        self.cum = [0.0]
-        for a, b in zip(self.pts, self.pts[1:]):
-            self.cum.append(self.cum[-1] + (b - a).length)
-        self.length = self.cum[-1]
-
-    def at(self, s):
-        s = clamp(s, 0, self.length)
-        lo, hi = 0, len(self.cum) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if self.cum[mid] <= s:
-                lo = mid
-            else:
-                hi = mid
-        d = self.cum[hi] - self.cum[lo]
-        t = 0 if d == 0 else (s - self.cum[lo]) / d
-        p = self.pts[lo].lerp(self.pts[hi], t)
-        tan = (self.pts[hi] - self.pts[lo]).normalized()
-        return p, tan
-
-    def dist(self, x, y):
-        q = Vector((x, y))
-        return min((p - q).length for p in self.pts[::2])
-
-
-# --------------------------------------------------------------------- layout
-
-CHOP_POS = (0.13, 2.72)
-STEVE_PATH = Path2D([(-16.5, 0.4), (-10.0, 1.2), (-4.5, 1.6), (-1.1, 2.1), CHOP_POS])
-CREEPER_PATH = Path2D([(-2.6, -12.5), (-1.8, -6.0), (-0.5, -1.4), (0.2, 1.3)])
-TREE_HERO = (0, 4)
-CHOP_BLOCK = (0, 4, 1)
-SPRINT_END = (5.2, 3.3)
-LAND_POS = (10.0, 2.6)
-REST_POS = (10.8, 2.5)
-CREEPER_END = (0.2, 1.3)
-CREEPER_SHUFFLE = (0.8, 1.4)
-EXPL_C = Vector((0.8, 1.4, 0.6))
-POND_C = (-9.5, -7.5)
-SUN_ROT = -58.0  # азимут солнца: запад-северо-запад
-SUN_DIR2 = Vector((math.sin(rad(SUN_ROT)), math.cos(rad(SUN_ROT))))
+S0 = Vector((0.0, 0.0))                     # Стив у факела на плато
+FH = Vector((-20.0, 27.0))                  # дальний холм, где появляется Herobrine
+D = (FH - S0).normalized()                  # от Стива к Herobrine
+RV = Vector((D.y, -D.x))                    # правая рука Стива, когда он смотрит на D
+FH_Z = 3.0                                  # высота поверхности на вершине холма
+H1 = S0 + D * 1.4                           # куда телепортируется Herobrine (удар)
+H2 = S0 + D * 5.4                           # куда отпрыгивает (заряд, луч)
+S_STEP = S0 - D * 0.12                      # Стив отступил при выхвате меча
+S_HIT = S0 - D * 0.42                       # после удара
+S1 = S0 - D * 2.6                           # после скольжения от луча
+JUMP_FROM = S1
+JUMP_TO = H2 - D * 2.5                      # приземление у края воронки, меч бьёт вперёд
+CAM_M = JUMP_TO + D * 3.3 + RV * 0.35       # камера финального плана
+HB_END = CAM_M + rot2((JUMP_TO - CAM_M).normalized(), 7.0) * 18.0  # глаза в темноте: в кадре слева от Стива
+MOON2 = rot2(D, 6.0)                        # луна чуть левее Herobrine (с точки Стива)
+MOON_EL = 7.5
+MOON_DIR = Vector((MOON2.x * math.cos(rad(MOON_EL)), MOON2.y * math.cos(rad(MOON_EL)), math.sin(rad(MOON_EL))))
+TORCH = (2, 0)                              # блок с факелом (сзади справа от Стива)
+YAW_D = yaw_to(D.x, D.y)
+YAW_H = yaw_to(-D.x, -D.y)
 
 # кадры событий
-F_ARRIVE = 205
-CONTACTS = [238 + 11 * i for i in range(8)]
-F_BREAK = CONTACTS[-1]
-F_PICKUP = 340
-F_CREEPER_IN = 349
-F_CREEPER_STOP = 476
-F_HISS = 492
-F_SPRINT = 532
-F_BOOM = 566
-F_LAND = 586
-F_REST = 594
-SHOTS = [("A", 1), ("B", 133), ("C", 229), ("D", 349), ("E", 445), ("F", 513), ("G", 560), ("H", 649)]
-
-cues = []  # звуковые метки -> mc_cues.json
-
-
-def cue(frame, sound, volume=1.0, channel=2, **kw):
-    c = {"frame": int(frame), "sound": sound, "volume": round(volume, 3), "channel": channel}
-    c.update(kw)
-    cues.append(c)
+F_BOLT = 199
+F_EYES = 262
+F_DRAW = 334
+F_TP_OUT = 386
+F_TP_IN = 392
+F_CLASH = 400
+SLOW = (400, 436)                           # замедление 4×
+F_CHARGE = 456
+F_BEAM, F_BEAM_END = 496, 520
+F_JUMP, F_SLAM = 549, 578
+F_VANISH = 575
+F_EYES2 = 692
+F_CUT = 712
 
 
-# ------------------------------------------------------------------ scene reset
+def tscale(f):
+    return 0.25 if SLOW[0] <= f < SLOW[1] else 1.0
+
+
+# ------------------------------------------------------------------- scene
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
-scene.name = "Minecraft Sunset"
-prefs = bpy.context.preferences.edit
-prefs.keyframe_new_handle_type = "AUTO_CLAMPED"
+scene.name = "Herobrine"
+scene.render.fps = FPS
+scene.frame_start, scene.frame_end = F0, F1
+bpy.context.preferences.edit.keyframe_new_handle_type = "AUTO_CLAMPED"
+C_WORLD = L.new_collection("World")
+C_CHARS = L.new_collection("Characters")
+C_FX = L.new_collection("FX")
+C_CAMS = L.new_collection("Cameras")
+C_LIGHTS = L.new_collection("Lights")
+cues = L.Cues()
 
-
-def coll(name):
-    c = bpy.data.collections.new(name)
-    scene.collection.children.link(c)
-    return c
-
-
-C_WORLD, C_CHARS, C_FX, C_CAMS, C_LIGHT = (coll(n) for n in ("World", "Characters", "FX", "Cameras", "Lights"))
-
-
-def link(obj, c):
-    c.objects.link(obj)
-    return obj
-
-
-def interp(kind):
-    prefs.keyframe_new_interpolation_type = kind
-
-
-def key_vis(obj, visible_ranges):
-    """visible_ranges: [(f_from, f_to_exclusive)]; вне диапазонов объект скрыт."""
-    interp("CONSTANT")
-    edges = {F_START - 1}
-    for a, b in visible_ranges:
-        edges.update((a, b))
-    for f in sorted(edges):
-        vis = any(a <= f < b for a, b in visible_ranges)
-        obj.hide_render = not vis
-        obj.hide_viewport = not vis
-        obj.keyframe_insert("hide_render", frame=f)
-        obj.keyframe_insert("hide_viewport", frame=f)
-    force_interp(obj, "hide_render", "CONSTANT")
-    force_interp(obj, "hide_viewport", "CONSTANT")
-    vis0 = any(a <= F_START < b for a, b in visible_ranges)
-    obj.hide_render = obj.hide_viewport = not vis0
-
-
-def fcurves_of(idb):
-    ad = idb.animation_data
-    if not ad or not ad.action:
-        return []
-    try:
-        from bpy_extras import anim_utils
-        cb = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
-        return list(cb.fcurves) if cb else []
-    except (ImportError, AttributeError):
-        return list(ad.action.fcurves)
-
-
-def force_interp(idb, path, kind):
-    for fc in fcurves_of(idb):
-        if fc.data_path == path:
-            for kp in fc.keyframe_points:
-                kp.interpolation = kind
-
-
-def key_prop(obj, prop, frames_values, kind="CONSTANT"):
-    interp(kind)
-    for f, v in frames_values:
-        obj[prop] = float(v)
-        obj.keyframe_insert('["%s"]' % prop, frame=f)
-    force_interp(obj, '["%s"]' % prop, kind)
-
-
-# ------------------------------------------------------------------- images
-
-IMAGES = {}
-
-
-def tex(name):
-    if name in IMAGES:
-        return IMAGES[name]
-    img = bpy.data.images.new(name, 16, 16, alpha=True)
-    img.source = "FILE"
-    img.filepath = "//textures/%s.png" % name
-    img["mc_tex"] = name
-    IMAGES[name] = img
-    return img
-
-
-def atlas(name, frames):
-    img = bpy.data.images.new("atlas/" + name, 16, 16, alpha=True)
-    img.source = "FILE"
-    img.filepath = "//textures/_atlas/%s.png" % name
-    img["mc_atlas"] = json.dumps(frames)
-    return img
-
-
-ATLAS_CRACK = atlas("destroy_stages", ["block/destroy_stage_%d" % i for i in range(10)])
-ATLAS_EXPL = atlas("explosion", ["particle/explosion_%d" % i for i in range(16)])
-ATLAS_SMOKE = atlas("big_smoke", ["particle/big_smoke_%d" % i for i in range(12)])
-
-# ---------------------------------------------------------------- materials
+# --------------------------------------------------------------- materials
 
 GRASS_TINT = srgb("91BD59")
 FOLIAGE_TINT = srgb("77AB2F")
-BIRCH_TINT = srgb("80A755")
+SPRUCE_TINT = srgb("619961")
 WATER_TINT = srgb("3F76E4")
-LILY_TINT = srgb("208030")
-
-
-class NT:
-    def __init__(self, mat):
-        self.nt = mat.node_tree
-        self.nt.nodes.clear()
-        self.x = 0
-
-    def n(self, kind, **props):
-        node = self.nt.nodes.new(kind)
-        for k, v in props.items():
-            setattr(node, k, v)
-        node.location = (self.x, 0)
-        self.x += 200
-        return node
-
-    def l(self, a, b):
-        self.nt.links.new(a, b)
-
-    def img(self, image, vec=None, ext="REPEAT"):
-        node = self.n("ShaderNodeTexImage", image=image, interpolation="Closest", extension=ext)
-        if vec is not None:
-            self.l(vec, node.inputs["Vector"])
-        return node
-
-    def math(self, op, a, b=None, clamp_=False):
-        node = self.n("ShaderNodeMath", operation=op, use_clamp=clamp_)
-        for i, v in enumerate((a, b)):
-            if v is None:
-                continue
-            if isinstance(v, (int, float)):
-                node.inputs[i].default_value = v
-            else:
-                self.l(v, node.inputs[i])
-        return node.outputs[0]
-
-    def vmul(self, a, b):
-        node = self.n("ShaderNodeVectorMath", operation="MULTIPLY")
-        self.l(a, node.inputs[0])
-        if isinstance(b, tuple):
-            node.inputs[1].default_value = b[:3]
-        else:
-            self.l(b, node.inputs[1])
-        return node.outputs[0]
-
-    def mixc(self, fac, a, b):
-        node = self.n("ShaderNodeMix", data_type="RGBA", blend_type="MIX")
-        for sock, v in ((node.inputs[0], fac), (node.inputs[6], a), (node.inputs[7], b)):
-            if isinstance(v, (int, float)):
-                sock.default_value = v
-            elif isinstance(v, tuple):
-                sock.default_value = v if len(v) == 4 else v + (1.0,)
-            else:
-                self.l(v, sock)
-        return node.outputs[2]
-
-    def attr(self, name):
-        return self.n("ShaderNodeAttribute", attribute_type="OBJECT", attribute_name=name).outputs["Fac"]
-
-    def principled(self, color, rough=0.85, spec=0.25, alpha=None, emission=None, emit_strength=0.0):
-        p = self.n("ShaderNodeBsdfPrincipled")
-        self.l(color, p.inputs["Base Color"])
-        p.inputs["Roughness"].default_value = rough
-        p.inputs["Specular IOR Level"].default_value = spec
-        if alpha is not None:
-            if isinstance(alpha, (int, float)):
-                p.inputs["Alpha"].default_value = alpha
-            else:
-                self.l(alpha, p.inputs["Alpha"])
-        if emission is not None:
-            self.l(emission, p.inputs["Emission Color"])
-            p.inputs["Emission Strength"].default_value = emit_strength
-        return p.outputs[0]
-
-    def out(self, shader):
-        o = self.n("ShaderNodeOutputMaterial")
-        self.l(shader, o.inputs["Surface"])
-
-
 MATS = {}
 
 
-def new_material(name):
-    m = bpy.data.materials.new(name)
-    if hasattr(m, "use_nodes") and not m.node_tree:
-        m.use_nodes = True
-    if hasattr(m, "surface_render_method"):
-        m.surface_render_method = "DITHERED"
-    return m
-
-
-def cutout_shader(t, color, alpha, translucent=0.0, rough=0.8):
-    shader = t.principled(color, rough=rough, spec=0.2)
-    if translucent > 0:
-        tr = t.n("ShaderNodeBsdfTranslucent")
-        t.l(color, tr.inputs["Color"])
-        mix = t.n("ShaderNodeMixShader")
-        mix.inputs[0].default_value = translucent
-        t.l(shader, mix.inputs[1])
-        t.l(tr.outputs[0], mix.inputs[2])
-        shader = mix.outputs[0]
-    transp = t.n("ShaderNodeBsdfTransparent")
-    mix = t.n("ShaderNodeMixShader")
-    t.l(alpha, mix.inputs[0])
-    t.l(transp.outputs[0], mix.inputs[1])
-    t.l(shader, mix.inputs[2])
-    return mix.outputs[0]
-
-
-def mat_block(key, texname, tint=None, alpha=False, translucent=0.0, rough=0.88, spec=0.22):
+def mat_block(key, texname, tint=None, cut=False, translucent=0.0, rough=0.9, spec=0.2):
     if key in MATS:
         return MATS[key]
     m = new_material("mc_" + key)
@@ -414,152 +101,58 @@ def mat_block(key, texname, tint=None, alpha=False, translucent=0.0, rough=0.88,
     col = im.outputs["Color"]
     if tint:
         col = t.vmul(col, tint)
-    if alpha:
-        t.out(cutout_shader(t, col, im.outputs["Alpha"], translucent))
-    else:
-        t.out(t.principled(col, rough, spec))
+    sh = t.principled(col, rough, spec)
+    if translucent > 0:
+        tr = t.n("ShaderNodeBsdfTranslucent")
+        t.l(col, tr.inputs["Color"])
+        sh = t.mixs(translucent, sh, tr.outputs[0])
+    if cut:
+        sh = t.cutout(sh, im.outputs["Alpha"])
+    t.out(sh)
     MATS[key] = m
     return m
 
 
 def mat_grass_side():
-    if "grass_side" in MATS:
-        return MATS["grass_side"]
     m = new_material("mc_grass_side")
     t = NT(m)
     base = t.img(tex("block/grass_block_side"), ext="EXTEND")
     ov = t.img(tex("block/grass_block_side_overlay"), ext="EXTEND")
-    tinted = t.vmul(ov.outputs["Color"], GRASS_TINT)
-    col = t.mixc(ov.outputs["Alpha"], base.outputs["Color"], tinted)
+    col = t.mixc(ov.outputs["Alpha"], base.outputs["Color"], t.vmul(ov.outputs["Color"], GRASS_TINT))
     t.out(t.principled(col, 0.9, 0.2))
-    MATS["grass_side"] = m
-    return m
-
-
-def mat_far_ground():
-    m = new_material("mc_far_ground")
-    t = NT(m)
-    tc = t.n("ShaderNodeTexCoord")
-    im = t.img(tex("block/grass_block_top"), tc.outputs["Object"], ext="REPEAT")
-    t.out(t.principled(t.vmul(im.outputs["Color"], GRASS_TINT), 0.9, 0.2))
     return m
 
 
 def mat_water():
     m = new_material("mc_water")
     t = NT(m)
-    val = t.n("ShaderNodeValue")
+    val = t.value(0.0)
     drv = val.outputs[0].driver_add("default_value")
     drv.driver.type = "SCRIPTED"
     drv.driver.expression = "frame"
-    # water_still: 32 кадра по 2 тика (0.1 с) сверху вниз
-    k = t.math("FLOOR", t.math("DIVIDE", val.outputs[0], FPS * 0.1))
-    k = t.math("FLOORED_MODULO", k, 32.0)
+    k = t.math("FLOORED_MODULO", t.math("FLOOR", t.math("DIVIDE", val.outputs[0], FPS * 0.1)), 32.0)
     off = t.math("DIVIDE", t.math("SUBTRACT", 31.0, k), 32.0)
-    uv = t.n("ShaderNodeTexCoord").outputs["UV"]
-    sep = t.n("ShaderNodeSeparateXYZ")
-    t.l(uv, sep.inputs[0])
-    comb = t.n("ShaderNodeCombineXYZ")
-    t.l(sep.outputs[0], comb.inputs[0])
-    t.l(t.math("ADD", t.math("DIVIDE", sep.outputs[1], 32.0), off), comb.inputs[1])
-    im = t.img(tex("block/water_still"), comb.outputs[0], ext="EXTEND")
+    uv = t.sep(t.n("ShaderNodeTexCoord").outputs["UV"])
+    vec = t.comb(uv[0], t.math("ADD", t.math("DIVIDE", uv[1], 32.0), off), 0.0)
+    im = t.img(tex("block/water_still"), vec, ext="EXTEND")
     col = t.vmul(im.outputs["Color"], WATER_TINT)
-    t.out(t.principled(col, rough=0.04, spec=0.6, alpha=0.78))
+    t.out(t.principled(col, rough=0.03, spec=0.7, alpha=0.82))
     return m
 
 
-def mat_sprite(name, atlas_img, frames, emit=0.0):
-    m = new_material(name)
+def mat_torch():
+    m = new_material("mc_torch")
     t = NT(m)
-    uv = t.n("ShaderNodeTexCoord").outputs["UV"]
-    sep = t.n("ShaderNodeSeparateXYZ")
-    t.l(uv, sep.inputs[0])
-    fr = t.math("FLOOR", t.attr("sprite_frame"))
-    u = t.math("DIVIDE", t.math("ADD", sep.outputs[0], fr), float(frames))
-    comb = t.n("ShaderNodeCombineXYZ")
-    t.l(u, comb.inputs[0])
-    t.l(sep.outputs[1], comb.inputs[1])
-    im = t.img(atlas_img, comb.outputs[0], ext="EXTEND")
-    tint = t.attr("tint")
-    col = t.vmul(im.outputs["Color"], tint)
-    alpha = t.math("MULTIPLY", im.outputs["Alpha"], t.attr("fade"))
-    sh = t.principled(col, rough=1.0, spec=0.0, emission=col, emit_strength=emit)
-    transp = t.n("ShaderNodeBsdfTransparent")
-    mix = t.n("ShaderNodeMixShader")
-    t.l(alpha, mix.inputs[0])
-    t.l(transp.outputs[0], mix.inputs[1])
-    t.l(sh, mix.inputs[2])
-    t.out(mix.outputs[0])
-    return m
-
-
-def mat_crack(key, texname):
-    """Бревно, по которому бьют: ванильные трещины destroy_stage поверх текстуры."""
-    m = new_material("mc_" + key)
-    t = NT(m)
-    base = t.img(tex(texname), ext="EXTEND")
-    stage = t.attr("stage")
-    uv = t.n("ShaderNodeTexCoord").outputs["UV"]
-    sep = t.n("ShaderNodeSeparateXYZ")
-    t.l(uv, sep.inputs[0])
-    comb = t.n("ShaderNodeCombineXYZ")
-    st = t.math("FLOOR", t.math("MAXIMUM", stage, 0.0))
-    t.l(t.math("DIVIDE", t.math("ADD", sep.outputs[0], st), 10.0), comb.inputs[0])
-    t.l(sep.outputs[1], comb.inputs[1])
-    cr = t.img(ATLAS_CRACK, comb.outputs[0], ext="EXTEND")
-    on = t.math("GREATER_THAN", stage, -0.5)
-    fac = t.math("MULTIPLY", cr.outputs["Alpha"], on)
-    # как в игре: blend DST_COLOR*SRC_COLOR*2
-    dbl = t.vmul(cr.outputs["Color"], (2.0, 2.0, 2.0))
-    mult = t.mixc(fac, (1.0, 1.0, 1.0), dbl)
-    col = t.vmul(base.outputs["Color"], mult)
-    t.out(t.principled(col, 0.88, 0.22))
-    return m
-
-
-def mat_entity(key, texname, flash=False):
-    m = new_material("mc_" + key)
-    t = NT(m)
-    im = t.img(tex(texname), ext="EXTEND")
+    im = t.img(tex("block/torch"), ext="EXTEND")
     col = im.outputs["Color"]
-    emission = None
-    if flash:
-        f = t.attr("flash")
-        col = t.mixc(t.math("MULTIPLY", f, 0.6), col, (1.0, 1.0, 1.0))
-        emission = col
-    sh = t.principled(col, rough=0.75, spec=0.2, emission=emission, emit_strength=0.0)
-    if flash:
-        # сила свечения = flash * 1.5
-        p = [n for n in t.nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"][0]
-        t.l(t.math("MULTIPLY", t.attr("flash"), 0.5), p.inputs["Emission Strength"])
-    transp = t.n("ShaderNodeBsdfTransparent")
-    mix = t.n("ShaderNodeMixShader")
-    t.l(im.outputs["Alpha"], mix.inputs[0])
-    t.l(transp.outputs[0], mix.inputs[1])
-    t.l(sh, mix.inputs[2])
-    t.out(mix.outputs[0])
-    return m
-
-
-def mat_clouds():
-    m = new_material("mc_clouds")
-    t = NT(m)
-    im = t.img(tex("environment/clouds"), ext="REPEAT")
-    white = (1.0, 1.0, 1.0, 1.0)
+    bw = t.n("ShaderNodeRGBToBW")
+    t.l(col, bw.inputs[0])
+    hot = t.math("GREATER_THAN", bw.outputs[0], 0.62)
     p = t.n("ShaderNodeBsdfPrincipled")
-    p.inputs["Base Color"].default_value = white
-    p.inputs["Roughness"].default_value = 1.0
-    tr = t.n("ShaderNodeBsdfTranslucent")
-    mix = t.n("ShaderNodeMixShader")
-    mix.inputs[0].default_value = 0.55
-    t.l(p.outputs[0], mix.inputs[1])
-    t.l(tr.outputs[0], mix.inputs[2])
-    transp = t.n("ShaderNodeBsdfTransparent")
-    mix2 = t.n("ShaderNodeMixShader")
-    t.l(t.math("MULTIPLY", im.outputs["Alpha"], 0.8), mix2.inputs[0])
-    t.l(transp.outputs[0], mix2.inputs[1])
-    t.l(mix.outputs[0], mix2.inputs[2])
-    t.out(mix2.outputs[0])
+    t.l(col, p.inputs["Base Color"])
+    t.l(col, p.inputs["Emission Color"])
+    t.l(t.math("MULTIPLY", hot, 14.0), p.inputs["Emission Strength"])
+    t.out(t.cutout(p.outputs[0], im.outputs["Alpha"]))
     return m
 
 
@@ -567,1264 +160,1456 @@ M = {
     "grass_top": mat_block("grass_top", "block/grass_block_top", GRASS_TINT),
     "grass_side": mat_grass_side(),
     "dirt": mat_block("dirt", "block/dirt"),
+    "coarse_dirt": mat_block("coarse_dirt", "block/coarse_dirt"),
     "stone": mat_block("stone", "block/stone"),
-    "coal_ore": mat_block("coal_ore", "block/coal_ore"),
-    "iron_ore": mat_block("iron_ore", "block/iron_ore"),
-    "sand": mat_block("sand", "block/sand"),
+    "andesite": mat_block("andesite", "block/andesite"),
+    "cobblestone": mat_block("cobblestone", "block/cobblestone"),
+    "mossy_cobblestone": mat_block("mossy_cobblestone", "block/mossy_cobblestone"),
     "gravel": mat_block("gravel", "block/gravel"),
+    "sand": mat_block("sand", "block/sand"),
+    "spruce_log": mat_block("spruce_log", "block/spruce_log"),
+    "spruce_log_top": mat_block("spruce_log_top", "block/spruce_log_top"),
     "oak_log": mat_block("oak_log", "block/oak_log"),
     "oak_log_top": mat_block("oak_log_top", "block/oak_log_top"),
-    "birch_log": mat_block("birch_log", "block/birch_log"),
-    "birch_log_top": mat_block("birch_log_top", "block/birch_log_top"),
-    "oak_leaves": mat_block("oak_leaves", "block/oak_leaves", FOLIAGE_TINT, alpha=True, translucent=0.3),
-    "birch_leaves": mat_block("birch_leaves", "block/birch_leaves", BIRCH_TINT, alpha=True, translucent=0.3),
-    "short_grass": mat_block("short_grass", "block/short_grass", GRASS_TINT, alpha=True, translucent=0.25),
-    "tall_grass_bottom": mat_block("tall_grass_bottom", "block/tall_grass_bottom", GRASS_TINT, alpha=True, translucent=0.25),
-    "tall_grass_top": mat_block("tall_grass_top", "block/tall_grass_top", GRASS_TINT, alpha=True, translucent=0.25),
-    "lily_pad": mat_block("lily_pad", "block/lily_pad", LILY_TINT, alpha=True),
+    "spruce_leaves": mat_block("spruce_leaves", "block/spruce_leaves", SPRUCE_TINT, cut=True, translucent=0.25),
+    "oak_leaves": mat_block("oak_leaves", "block/oak_leaves", FOLIAGE_TINT, cut=True, translucent=0.25),
     "water": mat_water(),
+    "torch": mat_torch(),
 }
-FLOWERS = ["poppy", "dandelion", "cornflower", "azure_bluet", "oxeye_daisy"]
-for fl in FLOWERS:
-    M[fl] = mat_block(fl, "block/" + fl, alpha=True, translucent=0.15)
+PLANT_MATS = {
+    "short_grass": mat_block("short_grass", "block/short_grass", GRASS_TINT, cut=True, translucent=0.25),
+    "fern": mat_block("fern", "block/fern", GRASS_TINT, cut=True, translucent=0.25),
+    "tall_grass_bottom": mat_block("tall_grass_bottom", "block/tall_grass_bottom", GRASS_TINT, cut=True, translucent=0.25),
+    "tall_grass_top": mat_block("tall_grass_top", "block/tall_grass_top", GRASS_TINT, cut=True, translucent=0.25),
+    "large_fern_bottom": mat_block("large_fern_bottom", "block/large_fern_bottom", GRASS_TINT, cut=True, translucent=0.25),
+    "large_fern_top": mat_block("large_fern_top", "block/large_fern_top", GRASS_TINT, cut=True, translucent=0.25),
+}
+for fl in ("cornflower", "azure_bluet", "oxeye_daisy", "poppy"):
+    PLANT_MATS[fl] = mat_block(fl, "block/" + fl, cut=True, translucent=0.15)
 
-# ------------------------------------------------------------------ geometry
+# ------------------------------------------------------------------- world
 
-UV_FULL = [(0, 0), (1, 0), (1, 1), (0, 1)]
-DIRS = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+vox = L.Voxels()
+vox.define("grass", "solid", M["grass_side"], M["grass_top"], M["dirt"], rot_top=True)
+for b in ("dirt", "coarse_dirt", "stone", "andesite", "cobblestone", "mossy_cobblestone", "gravel", "sand"):
+    vox.define(b, "solid", M[b], rot_top=b in ("dirt", "sand", "gravel"))
+for b in ("spruce", "oak"):
+    vox.define(b + "_log", "solid", M[b + "_log"], M[b + "_log_top"])
+    vox.define(b + "_leaves", "leaves", M[b + "_leaves"])
+vox.define("water", "water", M["water"])
 
-
-def face_pts(d, a, b):
-    """4 вершины грани (BL, BR, TR, TL, если смотреть на грань снаружи)."""
-    x0, y0, z0 = a
-    x1, y1, z1 = b
-    return {
-        "+z": [(x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)],
-        "-z": [(x0, y1, z0), (x1, y1, z0), (x1, y0, z0), (x0, y0, z0)],
-        "+x": [(x1, y0, z0), (x1, y1, z0), (x1, y1, z1), (x1, y0, z1)],
-        "-x": [(x0, y1, z0), (x0, y0, z0), (x0, y0, z1), (x0, y1, z1)],
-        "+y": [(x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1)],
-        "-y": [(x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1)],
-    }[d]
-
-
-class MB:
-    def __init__(self):
-        self.v, self.f, self.uv, self.mi, self.grp = [], [], [], [], []
-        self.mats, self.matidx = [], {}
-
-    def quad(self, pts, uvs, mat, group=None):
-        if mat.name not in self.matidx:
-            self.matidx[mat.name] = len(self.mats)
-            self.mats.append(mat)
-        i = len(self.v)
-        self.v.extend(pts)
-        self.f.append((i, i + 1, i + 2, i + 3))
-        self.uv.extend(uvs)
-        self.mi.append(self.matidx[mat.name])
-        self.grp.append(group)
-
-    def build(self, name, collection):
-        me = bpy.data.meshes.new(name)
-        me.from_pydata(self.v, [], self.f)
-        uvl = me.uv_layers.new(name="UVMap")
-        flat = [c for uv in self.uv for c in uv]
-        uvl.data.foreach_set("uv", flat)
-        for m in self.mats:
-            me.materials.append(m)
-        me.polygons.foreach_set("material_index", self.mi)
-        me.update()
-        obj = link(bpy.data.objects.new(name, me), collection)
-        groups = {}
-        for fi, g in enumerate(self.grp):
-            if g:
-                groups.setdefault(g, []).extend(self.f[fi])
-        for g, idx in groups.items():
-            obj.vertex_groups.new(name=g).add(idx, 1.0, "REPLACE")
-        return obj
+WH = 70
+WATER_Z = -8
 
 
-# --------------------------------------------------------------------- world
-
-WH = 56
-ZMIN = -6
-FLAT_R = 14.0
-
-
-def corridor_dist(x, y):
-    d = min(STEVE_PATH.dist(x, y), CREEPER_PATH.dist(x, y))
-    for a, b in ((CHOP_POS, SPRINT_END), (SPRINT_END, REST_POS)):
-        pa, pb, q = Vector(a), Vector(b), Vector((x, y))
-        t = clamp((q - pa).dot(pb - pa) / (pb - pa).length_squared)
-        d = min(d, (pa.lerp(pb, t) - q).length)
-    return d
+def nz(x, y, f, o):
+    return noise.noise(Vector((x * f, y * f, o)))
 
 
 def column_height(x, y):
-    cx, cy = x + 0.5, y + 0.5
-    d = math.hypot(cx * 0.9, cy)
-    m = sstep((d - FLAT_R) / 18.0)
-    # со стороны заката рельеф низкий, чтобы солнце не пряталось за холмами
-    ang = math.degrees(Vector((cx, cy)).normalized().angle(SUN_DIR2)) if d > 0.1 else 180
-    m *= lerp(0.06, 1.0, sstep((ang - 30) / 45.0))
-    n = noise.noise(Vector((cx * 0.045, cy * 0.045, 7.3)))
-    n2 = noise.noise(Vector((cx * 0.12, cy * 0.12, 2.1)))
-    h = m * (6.0 + 6.5 * n + 1.8 * n2)
-    hb = 0.0
-    if 7 < d and corridor_dist(cx, cy) > 3.0 and math.hypot(cx - POND_C[0], cy - POND_C[1]) > 6.5:
-        hb = max(0.0, noise.noise(Vector((cx * 0.17, cy * 0.17, 4.4)))) * 1.6 * (1 - m)
-    return -1 + int(math.floor(max(0.0, h) + hb + 0.5))
+    p = Vector((x + 0.5, y + 0.5))
+    d0 = p.length
+    valley = -8.6 + 2.4 * nz(p.x, p.y, 0.07, 1.3) + 0.9 * nz(p.x, p.y, 0.17, 5.1)
+    h = lerp(-1.0, valley, sstep((d0 - 8.0) / 11.0))
+    dfh = (p - FH).length
+    h = max(h, lerp(valley, FH_Z - 1 + 0.4 * nz(p.x, p.y, 0.3, 2.2), 1 - sstep((dfh - 4.0) / 10.0)))
+    ang = math.degrees(p.normalized().angle(MOON2)) if d0 > 0.5 else 180.0
+    ring = (10.0 + 7.0 * nz(p.x, p.y, 0.045, 8.8)) * lerp(0.3, 1.0, sstep((ang - 22) / 45.0))
+    h = max(h, valley + ring * sstep((d0 - 34.0) / 20.0))
+    return int(math.floor(h + 0.5))
 
 
 print("[build] terrain...")
-blocks = {}
-HMAP = {}
 for x in range(-WH, WH):
     for y in range(-WH, WH):
-        h = column_height(x, y)
-        pd = math.hypot(x + 0.5 - POND_C[0], y + 0.5 - POND_C[1])
-        if pd < 3.4:
-            h = -1
-            blocks[(x, y, -1)] = "water"
-            bottom = -3 if pd < 2.3 else -2
-            if bottom == -3:
-                blocks[(x, y, -2)] = "water"
-            blocks[(x, y, bottom)] = "sand" if pd < 1.8 else R.choice(("gravel", "dirt", "sand"))
-            for z in range(bottom - 1, ZMIN - 1, -1):
-                blocks[(x, y, z)] = "dirt" if z > bottom - 3 else "stone"
-            HMAP[(x, y)] = -2
-            continue
-        top = "sand" if pd < 4.5 else "grass"
-        HMAP[(x, y)] = h
-        blocks[(x, y, h)] = top
-        for z in range(h - 1, h - 4, -1):
-            blocks[(x, y, z)] = "sand" if (top == "sand" and z == h - 1) else "dirt"
-        for z in range(h - 4, ZMIN - 1, -1):
-            r = R.random()
-            blocks[(x, y, z)] = "coal_ore" if r < 0.035 else "iron_ore" if r < 0.05 else "stone"
-
-TREES = []
-
-
-def place_tree(x, y, kind="oak", height=None, rng=R):
-    base = HMAP[(x, y)] + 1
-    height = height or rng.randint(4, 6)
-    log = kind + "_log"
-    leaves = kind + "_leaves"
-    for z in range(base - 3 + height, base + height + 1):
-        j = z - (base + height)
-        k = 1 - int(j / 2)
-        for dx in range(-k, k + 1):
-            for dy in range(-k, k + 1):
-                if abs(dx) == k and abs(dy) == k and (rng.random() < 0.5 or j == 0):
-                    continue
-                p = (x + dx, y + dy, z)
-                if p not in blocks:
-                    blocks[p] = leaves
-    for z in range(base, base + height):
-        blocks[(x, y, z)] = log
-    TREES.append((x, y, kind, height))
-
-
-place_tree(TREE_HERO[0], TREE_HERO[1], "oak", 6, random.Random(7))
-CAMERA_SPOTS = [(9.0, -6.5), (5.4, -3.2), (-6.2, -2.6), (-0.4, -1.6), (2.5, 2.7), (4.2, 6.0),
-                (-1.3, 3.2), (-2.8, 1.0), (3.9, 1.9), (-1.1, -2.6), (6.5, -9.5), (15.0, 1.0), (14.2, 1.1)]
-FIXED_TREES = [(-7, 6, "oak"), (-13, -3, "oak"), (6, 9, "birch"), (-4, 10, "oak"),
-               (-18, 7, "oak"), (12, 8, "oak"), (-15, -12, "birch"), (3, -14, "oak")]
-for x, y, kind in FIXED_TREES:
-    place_tree(x, y, kind)
-attempts = 0
-while len(TREES) < 46 and attempts < 4000:
-    attempts += 1
-    x, y = R.randint(-WH + 3, WH - 4), R.randint(-WH + 3, WH - 4)
+        vox.hmap[(x, y)] = column_height(x, y)
+# площадки под персонажами ровные, чтобы ноги стояли точно на блоках
+for (x, y) in vox.hmap:
+    c_ = Vector((x + 0.5, y + 0.5))
+    if (c_ - FH).length < 2.3:
+        vox.hmap[(x, y)] = int(FH_Z) - 1
+    elif (c_ - HB_END).length < 1.8:
+        vox.hmap[(x, y)] = -1
+for (x, y), h in vox.hmap.items():
+    nbs = [vox.hmap.get((x + dx, y + dy), h) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+    low = min(min(nbs) - 1, h - 3, WATER_Z - 1 if h < WATER_Z else h - 3)
     cx, cy = x + 0.5, y + 0.5
-    if math.hypot(cx, cy) < 10 or corridor_dist(cx, cy) < 4 or math.hypot(cx - POND_C[0], cy - POND_C[1]) < 6:
-        continue
-    if any(math.hypot(cx - a, cy - b) < 4.5 for a, b in CAMERA_SPOTS):
-        continue
-    if any(math.hypot(x - t[0], y - t[1]) < 6 for t in TREES):
-        continue
-    # не загораживать закат в широких планах
-    v = Vector((cx, cy))
-    if v.length < 30 and math.degrees(v.normalized().angle(SUN_DIR2)) < 20:
-        continue
-    place_tree(x, y, "birch" if R.random() < 0.25 else "oak")
+    rocky = nz(cx, cy, 0.21, 3.3) > 0.32 and Vector((cx, cy)).length > 6.5
+    for z in range(h, low - 1, -1):
+        if z == h:
+            b = "grass" if h >= WATER_Z else ("sand" if h >= WATER_Z - 2 else "gravel")
+            if rocky and h > WATER_Z:
+                b = R.choice(("stone", "andesite", "cobblestone", "mossy_cobblestone", "stone"))
+        elif z > h - 3:
+            b = "dirt" if not rocky else "stone"
+        else:
+            b = "stone" if R.random() > 0.15 else "andesite"
+        vox.blocks[(x, y, z)] = b
+    vox.bottoms.add((x, y, low))
+    for z in range(h + 1, WATER_Z + 1):
+        vox.blocks[(x, y, z)] = "water"
 
-# крater: лучи взрыва (упрощённо — сфера с шумом), брёвна героя-дерева не трогаем
+# пара валунов на краю плато
+for bx, by, bz in ((-6, -3, 0), (-6, -2, 0), (-7, -3, 0), (-6, -3, 1), (5, 6, 0), (6, 6, 0), (6, 7, 0)):
+    vox.blocks[(bx, by, bz)] = R.choice(("cobblestone", "mossy_cobblestone", "stone"))
+vox.blocks[(TORCH[0], TORCH[1], 0)] = None
+del vox.blocks[(TORCH[0], TORCH[1], 0)]
+
+
+def seg_dist(p, a, b):
+    ab = b - a
+    t = clamp((p - a).dot(ab) / ab.length_squared)
+    return (a.lerp(b, t) - p).length
+
+
+# воронка от удара в землю: локальный кусок мира меняется в момент удара
+SLAM_C = Vector((H2.x, H2.y, 0.0))
 CRATER = set()
-for (x, y, z), b in blocks.items():
-    d = (Vector((x + 0.5, y + 0.5, z + 0.5)) - EXPL_C).length
-    if b.endswith("_log"):
-        continue
-    if d < 2.75 * (0.75 + 0.5 * random.Random(x * 73856093 ^ y * 19349663 ^ z * 83492791).random()):
-        CRATER.add((x, y, z))
-
-# растения
-PLANTS = []
-for (x, y), h in HMAP.items():
-    if blocks.get((x, y, h)) != "grass" or (x, y, h + 1) in blocks:
-        continue
-    cx, cy = x + 0.5, y + 0.5
-    if corridor_dist(cx, cy) < 1.3 or (Vector((cx, cy, 0)) - EXPL_C).length < 4.2:
-        continue
-    if any(math.hypot(cx - a, cy - b) < 3.0 for a, b in CAMERA_SPOTS):
-        continue
-    r = R.random()
-    if r < 0.17:
-        PLANTS.append((x, y, h + 1, "short_grass"))
-    elif r < 0.20:
-        PLANTS.append((x, y, h + 1, "tall_grass"))
-    elif r < 0.225:
-        PLANTS.append((x, y, h + 1, R.choice(FLOWERS)))
-
-OPAQUE = {"grass", "dirt", "stone", "coal_ore", "iron_ore", "sand", "gravel", "oak_log", "birch_log"}
-LEAVES = {"oak_leaves", "birch_leaves"}
-ROT_TOP = {"grass", "dirt", "sand"}
+LOCAL = (0, 0, 0, 0)
 
 
-def block_face_mat(b, d):
-    if b == "grass":
-        return M["grass_top"] if d == "+z" else M["dirt"] if d == "-z" else M["grass_side"]
-    if b.endswith("_log"):
-        return M[b + "_top"] if d in ("+z", "-z") else M[b]
-    return M[b]
-
-
-def poshash(x, y, z):
-    return (x * 73856093) ^ (y * 19349663) ^ (z * 83492791)
-
-
-def emit_world(removed):
-    terr, leaf, water = MB(), MB(), MB()
-    for p, b in blocks.items():
-        if p in removed:
+def build_crater(center):
+    global SLAM_C, LOCAL
+    SLAM_C = Vector((center.x, center.y, 0.0))
+    CRATER.clear()
+    for (x, y, z) in list(vox.blocks):
+        if z not in (-1, -2):
             continue
-        x, y, z = p
-        for d, (dx, dy, dz) in DIRS.items():
-            q = (x + dx, y + dy, z + dz)
-            nb = None if q in removed else blocks.get(q)
-            if nb in OPAQUE:
-                continue
-            if b == "water":
-                if nb == "water" or d == "-z":
-                    continue
-                top = z + 1 if blocks.get((x, y, z + 1)) == "water" else z + 8 / 9.0
-                water.quad(face_pts(d, (x, y, z), (x + 1, y + 1, top)), UV_FULL, M["water"])
-                continue
-            if b in LEAVES:
-                if nb in LEAVES and d in ("-x", "-y", "-z"):
-                    continue
-                leaf.quad(face_pts(d, (x, y, z), (x + 1, y + 1, z + 1)), UV_FULL, M[b])
-                continue
-            if d == "-z" and z == ZMIN:
-                continue
-            uv = UV_FULL
-            if d == "+z" and b in ROT_TOP:
-                k = poshash(x, y, z) & 3
-                uv = UV_FULL[k:] + UV_FULL[:k]
-            terr.quad(face_pts(d, (x, y, z), (x + 1, y + 1, z + 1)), uv, block_face_mat(b, d))
-    return terr, leaf, water
+        if math.hypot(x + 0.5 - JUMP_TO.x, y + 0.5 - JUMP_TO.y) < 0.9:
+            continue  # под ногами Стива земля целая
+        dxy = math.hypot(x + 0.5 - SLAM_C.x, y + 0.5 - SLAM_C.y)
+        jitter = 0.8 + 0.4 * random.Random(L.poshash(x, y, z)).random()
+        if (z == -1 and dxy < 2.4 * jitter) or (z == -2 and dxy < 1.1 * jitter):
+            CRATER.add((x, y, z))
+    LOCAL = (int(math.floor(SLAM_C.x)) - 6, int(math.floor(SLAM_C.x)) + 7,
+             int(math.floor(SLAM_C.y)) - 6, int(math.floor(SLAM_C.y)) + 7)
 
 
-def emit_plants(removed):
-    mb = MB()
-    for x, y, z, kind in PLANTS:
-        if (x, y, z - 1) in removed:
-            continue
-        hr = random.Random(poshash(x, y, z))
-        ox, oy = (hr.random() - 0.5) * 0.4, (hr.random() - 0.5) * 0.4
-        parts = [(z, kind)] if kind != "tall_grass" else [(z, "tall_grass_bottom"), (z + 1, "tall_grass_top")]
-        for zz, k in parts:
-            a, b = 0.05, 0.95
-            for (x0, y0), (x1, y1) in (((a, a), (b, b)), ((b, a), (a, b))):
-                pts = [(x + x0 + ox, y + y0 + oy, zz), (x + x1 + ox, y + y1 + oy, zz),
-                       (x + x1 + ox, y + y1 + oy, zz + 1), (x + x0 + ox, y + y0 + oy, zz + 1)]
-                mb.quad(pts, UV_FULL, M[k])
-    return mb
+def in_local(x, y):
+    return LOCAL[0] <= x < LOCAL[1] and LOCAL[2] <= y < LOCAL[3]
 
 
-print("[build] meshes...")
-REMOVED_A = {CHOP_BLOCK}
-REMOVED_B = REMOVED_A | CRATER
-world_objs = {}
-for tag, removed in (("A", REMOVED_A), ("B", REMOVED_B)):
-    terr, leaf, water = emit_world(removed)
-    world_objs["Terrain_" + tag] = terr.build("Terrain_" + tag, C_WORLD)
-    world_objs["Leaves_" + tag] = leaf.build("Leaves_" + tag, C_WORLD)
-    world_objs["Plants_" + tag] = emit_plants(removed).build("Plants_" + tag, C_WORLD)
-    if tag == "A":
-        world_objs["Water"] = water.build("Water", C_WORLD)
-for name, obj in world_objs.items():
-    if name.endswith("_A"):
-        key_vis(obj, [(F_START, F_BOOM)])
-    elif name.endswith("_B"):
-        key_vis(obj, [(F_BOOM, F_END + 10)])
+def not_local(x, y):
+    return not in_local(x, y)
 
-lily = MB()
-for i in range(3):
-    a = R.random() * math.tau
-    cx, cy = POND_C[0] + math.cos(a) * 1.6, POND_C[1] + math.sin(a) * 1.6
-    zz = -1 + 8 / 9.0 + 0.01
-    rot = R.random() * math.tau
-    pts = []
-    for dx, dy in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)):
-        pts.append((cx + dx * math.cos(rot) - dy * math.sin(rot), cy + dx * math.sin(rot) + dy * math.cos(rot), zz))
-    lily.quad(pts, UV_FULL, M["lily_pad"])
-lily.build("LilyPads", C_WORLD)
 
-# бесконечная равнина вокруг острова (с дыркой под воксельный мир)
-far = MB()
-big, inner = 2500.0, float(WH)
-fg = mat_far_ground()
-zf = -0.002
-for (x0, y0, x1, y1) in ((-big, -big, big, -inner), (-big, inner, big, big),
-                         (-big, -inner, -inner, inner), (inner, -inner, big, inner)):
-    far.quad([(x0, y0, zf), (x1, y0, zf), (x1, y1, zf), (x0, y1, zf)], UV_FULL, fg)
-far.build("FarPlains", C_WORLD)
+def crater_floor(x, y):
+    return vox.top_z(x, y, CRATER)
 
-# облака
-cl = MB()
-cs = 256 * 12.0
-cl.quad([(-cs / 2, -cs / 2, 110), (cs / 2, -cs / 2, 110), (cs / 2, cs / 2, 110), (-cs / 2, cs / 2, 110)],
-        [(0, 1), (1, 1), (1, 0), (0, 0)], mat_clouds())
-clouds = cl.build("Clouds", C_WORLD)
-clouds.visible_shadow = False
-interp("LINEAR")
-clouds.location = (0, 0, 0)
-clouds.keyframe_insert("location", frame=F_START)
-clouds.location = (16, 0, 0)
-clouds.keyframe_insert("location", frame=F_END)
 
-# бревно под топором
-chop = MB()
-cx, cy, cz = CHOP_BLOCK
-crack_side, crack_top = mat_crack("oak_log_crack", "block/oak_log"), mat_crack("oak_log_top_crack", "block/oak_log_top")
+# факел: ванильная модель 2×10 px
+tx, ty = TORCH
+mb = MB()
+a = (tx + 7 * PX, ty + 7 * PX, 0.0)
+b = (tx + 9 * PX, ty + 9 * PX, 10 * PX)
+side_uv = [(7 / 16, 0), (9 / 16, 0), (9 / 16, 10 / 16), (7 / 16, 10 / 16)]
+top_uv = [(7 / 16, 8 / 16), (9 / 16, 8 / 16), (9 / 16, 10 / 16), (7 / 16, 10 / 16)]
 for d in DIRS:
-    chop.quad(face_pts(d, (cx, cy, cz), (cx + 1, cy + 1, cz + 1)), UV_FULL,
-              crack_top if d in ("+z", "-z") else crack_side)
-chop_obj = chop.build("ChopLog", C_WORLD)
-stages = [(F_START, -1)]
-for i, f in enumerate(CONTACTS[:-1]):
-    stages.append((f, min(9, int((i + 1) * 10 / 7))))
-key_prop(chop_obj, "stage", stages)
-key_vis(chop_obj, [(F_START, F_BREAK)])
+    if d == "-z":
+        continue
+    mb.quad(face_pts(d, a, b), top_uv if d == "+z" else side_uv, M["torch"])
+torch_obj = mb.build("Torch", C_WORLD)
+TORCH_FLAME = Vector((tx + 0.5, ty + 0.5, 0.66))
 
-# --------------------------------------------------------------- characters
-
-
-def mc_box(mb, mat, mn, mx, uv0, dims, texsize, group, inflate=0.0):
-    u, v = uv0
-    w, h, d = dims
-    W, H = texsize
-    rects = {"+z": (u + d, v, w, d), "-z": (u + d + w, v, w, d), "-x": (u, v + d, d, h),
-             "-y": (u + d, v + d, w, h), "+x": (u + d + w, v + d, d, h), "+y": (u + 2 * d + w, v + d, w, h)}
-    a = tuple((c - inflate) * PX for c in mn)
-    b = tuple((c + inflate) * PX for c in mx)
-    for face, (ru, rv, rw, rh) in rects.items():
-        uvs = [(ru / W, 1 - (rv + rh) / H), ((ru + rw) / W, 1 - (rv + rh) / H),
-               ((ru + rw) / W, 1 - rv / H), (ru / W, 1 - rv / H)]
-        mb.quad(face_pts(face, a, b), uvs, mat, group)
-
-
-def make_rig(name, bones):
-    arm = bpy.data.armatures.new(name)
-    arm.display_type = "STICK"
-    rig = link(bpy.data.objects.new(name, arm), C_CHARS)
-    rig.show_in_front = True
-    bpy.context.view_layer.objects.active = rig
-    bpy.ops.object.mode_set(mode="EDIT")
-    for bname, head, tail, parent in bones:
-        eb = arm.edit_bones.new(bname)
-        eb.head = Vector(head) * PX
-        eb.tail = Vector(tail) * PX
-        eb.roll = 0
-        if parent:
-            eb.parent = arm.edit_bones[parent]
-    bpy.ops.object.mode_set(mode="OBJECT")
-    for pb in rig.pose.bones:
-        pb.rotation_mode = "XYZ"
-    return rig
-
-
-def skin(mb, name, rig):
-    obj = mb.build(name, C_CHARS)
-    obj.parent = rig
-    mod = obj.modifiers.new("Armature", "ARMATURE")
-    mod.object = rig
-    return obj
-
+# ------------------------------------------------------------- characters
 
 print("[build] characters...")
-STEVE_BONES = [
-    ("root", (0, 0, 0), (0, 8, 0), None),
-    ("body", (0, 0, 12), (0, 0, 24), "root"),
-    ("head", (0, 0, 24), (0, 0, 32), "body"),
-    ("arm.R", (-5, 0, 22), (-5, 0, 12), "body"),
-    ("arm.L", (5, 0, 22), (5, 0, 12), "body"),
-    ("leg.R", (-2, 0, 12), (-2, 0, 0), "root"),
-    ("leg.L", (2, 0, 12), (2, 0, 0), "root"),
-]
-steve_rig = make_rig("Steve_Rig", STEVE_BONES)
-steve_mat = mat_entity("steve", "entity/player/wide/steve")
-mb = MB()
-T64 = (64, 64)
-for mn, mx, uv, dims, grp, ov_uv, infl in [
-    ((-4, -4, 24), (4, 4, 32), (0, 0), (8, 8, 8), "head", (32, 0), 0.5),
-    ((-4, -2, 12), (4, 2, 24), (16, 16), (8, 12, 4), "body", (16, 32), 0.25),
-    ((-8, -2, 12), (-4, 2, 24), (40, 16), (4, 12, 4), "arm.R", (40, 32), 0.25),
-    ((4, -2, 12), (8, 2, 24), (32, 48), (4, 12, 4), "arm.L", (48, 48), 0.25),
-    ((-4, -2, 0), (0, 2, 12), (0, 16), (4, 12, 4), "leg.R", (0, 32), 0.25),
-    ((0, -2, 0), (4, 2, 12), (16, 48), (4, 12, 4), "leg.L", (0, 48), 0.25),
-]:
-    mc_box(mb, steve_mat, mn, mx, uv, dims, T64, grp)
-    mc_box(mb, steve_mat, mn, mx, ov_uv, dims, T64, grp, infl)
-steve = skin(mb, "Steve", steve_rig)
-
-# топор: меш строит mc_assets.py по пикселям item/iron_axe.png
-axe_mat = new_material("mc_item_iron_axe")
-t = NT(axe_mat)
-im = t.img(tex("item/iron_axe"), ext="EXTEND")
-t.out(t.principled(im.outputs["Color"], 0.55, 0.4))
-axe = link(bpy.data.objects.new("Steve_Axe", bpy.data.meshes.new("AxeMesh")), C_CHARS)
-axe.data.materials.append(axe_mat)
-axe["mc_item"] = "item/iron_axe"
-bone = steve_rig.data.bones["arm.R"]
-m_tail = Matrix.Translation(bone.tail_local) @ bone.matrix_local.to_3x3().to_4x4()
-axe.parent = steve_rig
-axe.parent_type = "BONE"
-axe.parent_bone = "arm.R"
-axe.matrix_parent_inverse = m_tail.inverted()
-# рукоять в кулаке, топорище вперёд, лезвие вниз (в замахе смотрит вперёд)
-axe.matrix_basis = (Matrix.Translation(Vector((-6, -0.5, 13.5)) * PX)
-                    @ Matrix.Rotation(rad(180), 4, "Y") @ Matrix.Rotation(rad(45), 4, "X")
-                    @ Matrix.Rotation(rad(-90), 4, "Z"))
-
-CREEPER_BONES = [
-    ("root", (0, 0, 0), (0, 8, 0), None),
-    ("body", (0, 0, 6), (0, 0, 18), "root"),
-    ("head", (0, 0, 18), (0, 0, 26), "body"),
-    ("leg.FR", (-2, -4, 6), (-2, -4, 0), "root"),
-    ("leg.FL", (2, -4, 6), (2, -4, 0), "root"),
-    ("leg.BR", (-2, 4, 6), (-2, 4, 0), "root"),
-    ("leg.BL", (2, 4, 6), (2, 4, 0), "root"),
-]
-creeper_rig = make_rig("Creeper_Rig", CREEPER_BONES)
-creeper_mat = mat_entity("creeper", "entity/creeper/creeper", flash=True)
-mb = MB()
-T32 = (64, 32)
-mc_box(mb, creeper_mat, (-4, -4, 18), (4, 4, 26), (0, 0), (8, 8, 8), T32, "head")
-mc_box(mb, creeper_mat, (-4, -2, 6), (4, 2, 18), (16, 16), (8, 12, 4), T32, "body")
-for bname, (lx, ly) in (("leg.FR", (-2, -4)), ("leg.FL", (2, -4)), ("leg.BR", (-2, 4)), ("leg.BL", (2, 4))):
-    mc_box(mb, creeper_mat, (lx - 2, ly - 2, 0), (lx + 2, ly + 2, 6), (0, 16), (4, 6, 4), T32, bname)
-creeper = skin(mb, "Creeper", creeper_rig)
-
-# ------------------------------------------------------------- Steve motion
-
-ST = {}
+steve = L.Character("Steve", C_CHARS, "entity/player/wide/steve")
+hero = L.Character("Herobrine", C_CHARS, "entity/player/wide/steve", glow_eyes=True)
+sword = steve.hold_item("item/diamond_sword", "R", rough=0.22, metal=0.0, emit=0.0)
 
 
-def T(ch):
-    if ch not in ST:
-        ST[ch] = Track()
-    return ST[ch]
+def item_basis(ch, grip_deg, side="R"):
+    """Меч перпендикулярно предплечью (вперёд, +15° вверх); grip поворачивает в ладони."""
+    px = ch.px
+    a = Vector((1, 0, 1)).normalized()
+    t = Vector((0, 1, 0))
+    c = a.cross(t)
+    a2 = Vector((0, -math.cos(rad(15)), math.sin(rad(15))))
+    t2 = Vector((1, 0, 0))
+    c2 = a2.cross(t2)
+    m_item = Matrix((a, t, c)).transposed()
+    m_tgt = Matrix((a2, t2, c2)).transposed()
+    rot = (Matrix.Rotation(rad(grip_deg), 3, t2) @ m_tgt @ m_item.transposed()).to_4x4()
+    x = -6 if side == "R" else 6
+    return Matrix.Translation(Vector((x, -1.2, 12.6)) * px) @ rot
 
 
-def keys(ch, *ks):
-    tr = T(ch)
-    for k in ks:
-        tr.add(*k)
+def bake_grip(obj, ch, grip_track, frames):
+    obj.rotation_mode = "QUATERNION"
+    interp("LINEAR")
+    prev = None
+    for f in frames:
+        mbasis = item_basis(ch, grip_track(f))
+        loc, q, _ = mbasis.decompose()
+        if prev is not None and prev.dot(q) < 0:
+            q = -q
+        prev = q
+        obj.location = loc
+        obj.rotation_quaternion = q
+        obj.keyframe_insert("location", frame=f)
+        obj.keyframe_insert("rotation_quaternion", frame=f)
 
 
-# скорость ходьбы: постоянная, плавная остановка за 15 кадров
-WALK_DECEL = 15
-_walk_v = STEVE_PATH.length / ((F_ARRIVE - WALK_DECEL - 1) + WALK_DECEL / 2.0)
+# ----------------------------------------------------------- choreography
+
+BLINKS_STEVE = [40, 96, 142, 170, 199, 236, 290, 318, 360, 445, 470, 532, 604, 628, 662, 690]
 
 
-def walk_s(f):
-    t_c = F_ARRIVE - WALK_DECEL
-    if f <= t_c:
-        return _walk_v * (f - 1), _walk_v
-    tt = min(f, F_ARRIVE) - t_c
-    return _walk_v * (t_c - 1) + _walk_v * (tt - tt * tt / (2.0 * WALK_DECEL)), _walk_v * max(0.0, 1 - tt / WALK_DECEL)
+def blink_at(f, starts):
+    for s in starts:
+        k = f - s
+        if 0 <= k <= 4:
+            return (0.5, 1.0, 1.0, 0.5, 0.0)[k]
+    return 0.0
 
 
-def sprint_pos(f):
-    t = seg(f, F_SPRINT, F_BOOM)
-    d = 0.5 * t * t + 0.5 * t
-    a, b = Vector(CHOP_POS), Vector(SPRINT_END)
-    return a.lerp(b, d), (b - a).length * (t + 0.5) / (F_BOOM - F_SPRINT)
+IDLE = {"arm.R.fwd": 3, "arm.R.out": 5, "arm.R.bend": 12, "arm.L.fwd": 3, "arm.L.out": 5, "arm.L.bend": 12,
+        "torso.pitch": 0, "chest.pitch": 0, "chest.yaw": 0, "head.pitch": 0, "head.yaw": 0, "head.roll": 0,
+        "leg.R.fwd": 0, "leg.L.fwd": 0, "leg.R.bend": 0, "leg.L.bend": 0, "leg.R.out": 1, "leg.L.out": 1,
+        "z": 0.0, "torso.yaw": 0, "brow": 0, "mouth": 0, "arm.R.twist": 0, "arm.L.twist": 0}
+TENSE = dict(IDLE, **{"arm.R.out": 9, "arm.R.bend": 26, "arm.L.out": 9, "arm.L.bend": 26, "torso.pitch": 4,
+                      "chest.pitch": 2, "head.pitch": 3, "leg.R.bend": 6, "leg.L.bend": 6, "z": -0.01})
+GUARD = {"arm.R.fwd": 46, "arm.R.out": 6, "arm.R.bend": 56, "arm.R.twist": 0,
+         "arm.L.fwd": 28, "arm.L.out": 24, "arm.L.bend": 48, "arm.L.twist": 0,
+         "torso.pitch": 8, "torso.yaw": -10, "chest.pitch": 2, "chest.yaw": -12,
+         "head.pitch": 0, "head.yaw": 14, "head.roll": 0,
+         "leg.L.fwd": 18, "leg.L.bend": 22, "leg.L.out": 6, "leg.R.fwd": -22, "leg.R.bend": 14, "leg.R.out": 6,
+         "z": -0.055, "brow": 1.0, "grip": 42}
+BLOCK = dict(GUARD, **{"arm.R.fwd": 40, "arm.R.out": -12, "arm.R.bend": 42, "arm.L.fwd": 52, "arm.L.out": -22,
+                       "arm.L.bend": 64, "chest.yaw": -4, "torso.yaw": -4, "head.yaw": 4, "head.pitch": 4, "grip": 37})
 
+st = Anim(L.POSE_DEFAULTS)
+st.defaults.update({"x": S0.x, "y": S0.y, "yaw": YAW_D, "grip": 0.0})
+st.K(1, IDLE)
+st.K(1, {"x": S0.x, "y": S0.y})
+# 1–110: оглядывается у факела
+st.K(30, head__yaw=8, head__pitch=-3)
+st.K(78, head__yaw=-12, head__pitch=-2)
+st.K(108, head__yaw=0, head__pitch=0)
+# 111–186: крупный план — глаза бегают, голова следом
+st.K(115, look=0, e="const")
+st.K(116, look=-1, e="const")
+st.K(121, head__yaw=0)
+st.K(132, head__yaw=-30, head__pitch=2, head__roll=-3, e="io")
+st.K(137, look=0, e="const")
+st.K(150, look=0, e="const")
+st.K(151, look=1, e="const")
+st.K(153, head__yaw=-30, head__roll=-3)
+st.K(166, head__yaw=24, head__pitch=-1, head__roll=3, e="io")
+st.K(158, brow=0, e="const")
+st.K(159, brow=-0.5, e="const")
+st.K(172, look=1, e="const")
+st.K(173, look=0, e="const")
+st.K(174, head__yaw=24, head__roll=3)
+st.K(186, head__yaw=0, head__pitch=0, head__roll=0, e="io")
+# 187–240: молния — вздрагивает
+st.K(199, IDLE)
+st.K(199, brow=-0.5)
+st.K(204, {"chest.pitch": -7, "arm.R.out": 16, "arm.L.out": 16, "arm.R.bend": 30, "arm.L.bend": 30,
+           "head.pitch": -8, "z": -0.05, "leg.R.bend": 10, "leg.L.bend": 10, "brow": -1.0, "mouth": 0.5}, e="snap")
+st.K(226, TENSE, e="io")
+st.K(226, mouth=0.0)
+st.K(238, brow=0.5)
+# 241–310: (за кадром) напряжён
+st.K(310, TENSE)
+st.K(310, brow=0.5)
+# 311–380: злится, отступает, выхватывает меч
+st.K(316, brow=1.0, e="const")
+st.K(318, blink=0, e="const")
+st.K(319, blink=0.5, e="const")
+st.K(318, {"leg.R.fwd": 0, "x": S0.x, "y": S0.y, "torso.yaw": 0, "chest.yaw": 0})
+st.K(326, {"leg.R.fwd": -20, "leg.R.bend": 10, "leg.L.fwd": 8, "leg.L.bend": 8, "x": S_STEP.x, "y": S_STEP.y,
+           "torso.yaw": 6, "z": -0.03}, e="io")
+st.K(324, {"arm.R.fwd": 3, "arm.R.out": 9, "arm.R.bend": 26, "chest.yaw": 0, "head.yaw": 0})
+st.K(333, {"arm.R.fwd": 158, "arm.R.out": 34, "arm.R.bend": 118, "chest.yaw": 20, "head.yaw": -12,
+           "torso.pitch": 2}, e="io")
+st.K(324, grip=0)
+st.K(333, grip=-35)
+st.K(341, {"arm.R.fwd": 58, "arm.R.out": 10, "arm.R.bend": 48, "chest.yaw": -20, "head.yaw": 16,
+           "torso.pitch": 9}, e="out")
+st.K(341, grip=30, e="out")
+st.K(352, GUARD, e="back")
+st.K(380, GUARD)
+# 381–400: Herobrine рядом — блок
+st.K(389, GUARD)
+st.K(397, BLOCK, e="out")
+st.K(397, blink=0.0, e="const")
+st.K(400, BLOCK)
+st.K(400, {"x": S_STEP.x, "y": S_STEP.y})
+# 400–436 (замедление): отдача
+st.K(436, dict(BLOCK, **{"torso.pitch": -6, "chest.pitch": -8, "head.pitch": -4, "z": -0.11, "leg.L.bend": 34,
+                         "leg.R.bend": 20, "arm.R.fwd": 36, "arm.L.fwd": 48, "mouth": 0.5, "blink": 0.5,
+                         "x": S_HIT.x, "y": S_HIT.y}), e="out")
+st.K(452, dict(GUARD, **{"x": S_HIT.x, "y": S_HIT.y, "mouth": 0.0, "blink": 0.0}), e="io")
+BRACE = dict(GUARD, **{"z": -0.09, "leg.L.bend": 30, "leg.R.bend": 18, "leg.L.fwd": 22, "leg.R.fwd": -26,
+                       "torso.pitch": 12})
+st.K(470, BRACE)
+st.K(494, BRACE)
+st.K(494, {"x": S_HIT.x, "y": S_HIT.y})
+BEAMBLOCK = {"arm.R.fwd": 50, "arm.R.out": -14, "arm.R.bend": 46, "arm.L.fwd": 58, "arm.L.out": -26,
+             "arm.L.bend": 80, "torso.pitch": 18, "torso.yaw": -4, "chest.yaw": -4, "chest.pitch": 4,
+             "head.pitch": -6, "head.yaw": 4, "leg.L.fwd": 32, "leg.L.bend": 42, "leg.R.fwd": -36, "leg.R.bend": 6,
+             "z": -0.15, "blink": 0.5, "mouth": 0.5, "grip": 10}
+st.K(498, BEAMBLOCK, e="snap")
+st.K(518, dict(BEAMBLOCK, **{"x": S1.x, "y": S1.y}), e="out")
+st.K(498, {"x": S_HIT.x, "y": S_HIT.y})
+st.K(518, BEAMBLOCK)
+st.K(528, dict(TENSE, **{"torso.pitch": 26, "chest.pitch": 10, "head.pitch": 18, "arm.R.fwd": 24, "arm.R.bend": 20,
+                         "arm.L.fwd": 6, "arm.L.out": 12, "z": -0.07, "leg.R.bend": 14, "leg.L.bend": 14,
+                         "mouth": 0.5, "blink": 0.0, "brow": 0.5, "grip": 50}), e="out")
+st.K(538, dict(GUARD, **{"head.pitch": -6, "mouth": 0.0, "brow": 1.0}), e="io")
+# 541–578: присед, прыжок, удар сверху
+CROUCH = {"z": -0.34, "torso.pitch": 34, "chest.pitch": 10, "chest.yaw": 0, "torso.yaw": 0, "head.pitch": -16,
+          "head.yaw": 0, "leg.R.fwd": 52, "leg.R.bend": 98, "leg.L.fwd": 46, "leg.L.bend": 92, "leg.R.out": 5,
+          "leg.L.out": 5, "arm.R.fwd": -42, "arm.R.bend": 22, "arm.R.out": 10, "arm.L.fwd": -46, "arm.L.bend": 16,
+          "arm.L.out": 14, "grip": 110}
+st.K(548, CROUCH, e="io")
+st.K(553, {"z": 0.0, "torso.pitch": -6, "chest.pitch": -6, "head.pitch": -22, "leg.R.fwd": -12, "leg.R.bend": 6,
+           "leg.L.fwd": -6, "leg.L.bend": 8, "arm.R.fwd": 150, "arm.R.bend": 40, "arm.L.fwd": 140, "arm.L.bend": 50,
+           "arm.R.out": -6, "arm.L.out": -10, "grip": 88, "mouth": 0.75}, e="out")
+st.K(564, {"torso.pitch": -14, "chest.pitch": -8, "head.pitch": -10, "leg.R.fwd": 52, "leg.R.bend": 84,
+           "leg.L.fwd": 30, "leg.L.bend": 96, "arm.R.fwd": 176, "arm.R.bend": 34, "arm.L.fwd": 170, "arm.L.bend": 40,
+           "grip": 100}, e="out")
+st.K(573, {"torso.pitch": -20, "chest.pitch": -10, "arm.R.fwd": 192, "arm.R.bend": 62, "arm.L.fwd": 186,
+           "arm.L.bend": 66, "head.pitch": 4, "grip": 104}, e="io")
+SLAMPOSE = {"torso.pitch": 34, "chest.pitch": 8, "head.pitch": -20, "head.yaw": 0, "leg.R.fwd": 74, "leg.R.bend": 88,
+            "leg.L.fwd": -4, "leg.L.bend": 104, "leg.R.out": 8, "leg.L.out": 4, "arm.R.fwd": 46, "arm.R.bend": 8,
+            "arm.R.out": 4, "arm.L.fwd": -28, "arm.L.bend": 22, "arm.L.out": 46, "grip": 112, "mouth": 0.75}
+st.K(578, SLAMPOSE, e="in")
+st.K(582, dict(SLAMPOSE, **{"leg.R.bend": 104, "leg.L.bend": 118, "torso.pitch": 44}), e="out")
+st.K(586, dict(SLAMPOSE, **{"torso.pitch": 42, "head.pitch": -14, "mouth": 0.0}), e="out")
+st.K(600, dict(SLAMPOSE, **{"torso.pitch": 36, "head.pitch": -18}), e="io")
+TIRED = dict(TENSE, **{"torso.pitch": 12, "chest.pitch": 6, "head.pitch": 10, "arm.R.fwd": 16, "arm.R.bend": 14,
+                       "arm.R.out": 8, "arm.L.fwd": 4, "arm.L.out": 10, "arm.L.bend": 16, "grip": 62,
+                       "leg.R.fwd": -6, "leg.L.fwd": 8, "leg.R.bend": 8, "leg.L.bend": 10, "brow": 0.5, "mouth": 0.25})
+st.K(622, TIRED, e="io")
+st.K(636, look=0, e="const")
+st.K(637, look=-1, e="const")
+st.K(639, head__yaw=0)
+st.K(652, head__yaw=-40, head__pitch=4, e="io")
+st.K(656, look=-1, e="const")
+st.K(657, look=1, e="const")
+st.K(659, head__yaw=-40)
+st.K(673, head__yaw=32, head__pitch=2, e="io")
+st.K(676, look=1, e="const")
+st.K(677, look=0, e="const")
+st.K(678, head__yaw=32)
+st.K(690, head__yaw=0, head__pitch=4, e="io")
+st.K(699, brow=0.5, e="const")
+st.K(700, brow=-0.75, e="const")
+st.K(702, look=0, e="const")
+st.K(703, look=-1, e="const")
+st.K(705, head__yaw=0)
+st.K(712, head__yaw=-7, e="io")
 
-# --- ключевые позы (градусы; fwd>0 — конечность вперёд, pitch>0 — наклон вперёд/вниз, yaw>0 — влево)
-keys("root.yaw", (200, None), (214, 180.0, "io"))
-keys("head.pitch", (1, 4), (150, 4), (175, -16), (F_ARRIVE, -20), (212, -32), (222, 6), (230, 2))
-keys("head.yaw", (1, 0), (55, 14), (95, -12), (140, 6), (175, 18), (200, 24), (213, 0))
-keys("arm.R.fwd", (F_ARRIVE, 0), (214, 0), (222, 40), (230, 176), (234, 178, "lin"))
-keys("arm.R.out", (1, 3), (222, 3), (230, 10))
-keys("arm.L.fwd", (F_ARRIVE, 0), (216, 0), (224, 18))
-keys("arm.L.out", (1, 3), (224, 10))
-keys("body.pitch", (1, 0), (222, 0), (230, -8))
-keys("body.yaw", (1, 0), (222, 0), (230, -10))
-keys("root.z", (1, 0))
-
-# рубка: замах — удар — отдача; последний удар сильнее
-for i, c in enumerate(CONTACTS):
-    if i > 0:
-        p = CONTACTS[i - 1]
-        top = 178 if i == len(CONTACTS) - 1 else 165
-        keys("arm.R.fwd", (p + 3, 72, "out"), (c - 3, top, "io"))
-        keys("body.pitch", (p + 4, 1, "out"), (c - 3, -7, "io"))
-        keys("body.yaw", (p + 4, 0, "out"), (c - 3, -11, "io"))
-        keys("arm.L.fwd", (c - 3, 26, "io"))
-    keys("arm.R.fwd", (c, 60, "in"))
-    keys("body.pitch", (c, 10, "in"))
-    keys("body.yaw", (c, 6, "in"))
-    keys("arm.L.fwd", (c, 8, "in"))
-    keys("head.pitch", (c - 2, 0), (c, 6, "in"), (c + 3, 2, "out"))
-    keys("root.y", (c - 3, CHOP_POS[1]), (c, CHOP_POS[1] + 0.03, "in"), (c + 5, CHOP_POS[1], "out"))
-    cue(c, "step/wood%d" % R.randint(1, 6), 0.7)
-cue(F_BREAK, "dig/wood%d" % R.randint(1, 4), 1.0)
-
-fb = F_BREAK
-keys("arm.R.fwd", (fb + 4, 34, "out"), (fb + 10, -6, "io"), (fb + 16, 2, "io"), (fb + 20, 0, "io"))
-keys("arm.R.out", (fb + 10, 3))
-keys("body.pitch", (fb + 6, 0, "out"))
-keys("body.yaw", (fb + 6, 0, "out"))
-keys("arm.L.fwd", (fb + 8, 0, "io"))
-keys("arm.L.out", (fb + 8, 3, "io"))
-# взгляд за выпавшим бревном, подбор, взгляд на висящее дерево, чешет затылок
-keys("head.pitch", (fb + 3, 4), (fb + 8, 34, "out"), (F_PICKUP - 2, 34), (F_PICKUP + 2, 14, "out"),
-     (344, 10), (356, -46, "io"), (384, -40), (392, -6, "io"), (400, 22, "io"), (410, 6, "io"),
-     (440, 4), (470, 0), (500, 30), (512, 8, "io"))
-keys("head.yaw", (fb + 3, 0), (fb + 8, 8, "out"), (F_PICKUP + 2, 0), (390, 0), (398, -28, "io"), (408, -4, "io"),
-     (500, 0), (512, 72, "io"))
-keys("head.roll", (1, 0), (356, 0), (366, 14, "io"), (384, 12), (392, 0, "io"))
-keys("body.pitch", (344, 0), (356, -6, "io"), (384, -5), (392, 0, "io"))
-keys("arm.L.fwd", (356, 0), (365, 168, "io"))
-keys("arm.L.out", (356, 3), (365, -18, "io"))
-for j, f in enumerate(range(366, 380, 3)):
-    keys("arm.L.fwd", (f, 162 if j % 2 else 172, "io"))
-keys("arm.L.fwd", (380, 168), (390, -4, "io"), (395, 0, "io"))
-keys("arm.L.out", (380, -18), (390, 3, "io"))
-keys("arm.R.fwd", (410, 0), (424, 40, "io"), (440, 46), (470, 140, "io"), (492, 150, "out"), (512, 150))
-keys("arm.R.out", (410, 3), (440, 8))
-
-# испуг: голова — прыжок с разворотом — разбег
-keys("head.yaw", (515, 98, "snap"), (525, 18, "io"), (529, 40, "out"), (536, 0, "io"))
-keys("head.pitch", (515, 0, "snap"), (525, -6), (532, 4))
-keys("root.yaw", (515, 180), (525, 345, "io"), (532, 450, "io"))
-keys("root.z", (516, 0), (520, 0.42, "out"), (525, 0, "in"))
-keys("arm.R.fwd", (512, 150), (518, 172, "out"), (526, 60, "io"), (532, 20, "io"))
-keys("arm.R.out", (512, 8), (518, 30, "out"), (526, 10, "io"))
-keys("arm.L.fwd", (512, 0), (518, 166, "out"), (526, 50, "io"), (532, 10, "io"))
-keys("arm.L.out", (512, 3), (518, 30, "out"), (526, 8, "io"))
-keys("leg.R.fwd", (516, 0), (520, 22, "out"), (525, 0, "in"))
-keys("leg.L.fwd", (516, 0), (520, -18, "out"), (525, 0, "in"))
-keys("body.pitch", (525, 0), (530, 18, "io"), (566, 18))
-keys("body.yaw", (525, 0))
-keys("head.yaw", (544, 0), (548, 70, "out"), (555, 0, "io"))
-
-# падение после взрыва — полёт — встаёт — смотрит — поворот к камере — «ну такое»
-keys("root.yaw", (F_BOOM, 450))
-keys("body.pitch", (F_BOOM + 2, 0, "out"))
-keys("head.pitch", (F_BOOM, 4), (F_BOOM + 4, -22, "out"), (F_LAND, -10), (F_LAND + 4, 6, "out"))
-keys("head.yaw", (F_BOOM, 0))
-keys("leg.R.fwd", (618, 0), (621, -22, "out"), (625, 0, "io"), (628, -14, "out"), (632, 0, "io"), (650, 0))
-keys("root.pitch", (1, 0), (F_BOOM, 0), (584, 90, "io"), (650, 90), (664, 0, "io"), (668, -4, "io"), (672, 0, "io"))
-keys("root.roll", (1, 0))
-keys("arm.R.fwd", (594, 8), (650, 8), (655, 92, "io"), (664, 0, "io"))
-keys("arm.L.fwd", (594, 8), (650, 8), (655, 92, "io"), (664, 0, "io"))
-keys("arm.R.out", (594, 10), (664, 3, "io"))
-keys("arm.L.out", (594, 10), (664, 3, "io"))
-keys("leg.L.fwd", (656, 0), (660, -28, "out"), (664, 0, "io"))
-keys("head.pitch", (650, 8), (664, 0, "io"))
-keys("head.yaw", (664, 0), (668, 0), (672, 50, "out"), (681, 0, "io"))
-keys("root.yaw", (670, 450), (682, 634, "io"))
-keys("head.pitch", (682, 0), (686, -8, "io"))
-keys("head.yaw", (686, 0), (688, 10, "io"), (690, -10, "io"), (692, 8, "io"), (694, 0, "io"))
-keys("head.yaw", (695, -55, "out"), (703, 0, "io"))
-keys("root.yaw", (694, 634), (702, 430, "io"))
-keys("arm.R.fwd", (674, 0), (677, 12, "io"), (681, -10, "io"), (684, 0, "io"), (700, 0), (706, 26, "out"))
-keys("arm.L.fwd", (674, 0), (677, -12, "io"), (681, 10, "io"), (684, 0, "io"), (700, 0), (706, 26, "out"))
-keys("arm.R.out", (700, 3), (706, 38, "out"))
-keys("arm.L.out", (700, 3), (706, 38, "out"))
-keys("head.roll", (700, 0), (706, 14, "out"))
-keys("head.pitch", (700, -8), (706, -3, "out"))
-keys("root.z", (F_BOOM, 0.0), (650, 0.25), (664, 0, "io"), (704, 0), (706, -0.04, "out"), (709, 0.02, "io"), (712, 0, "io"))
-
-for ch in ("leg.R.fwd", "leg.L.fwd", "arm.R.out", "arm.L.out", "head.roll", "body.yaw", "root.pitch", "root.roll"):
-    if not T(ch).k:
-        keys(ch, (1, 0))
-if not T("root.x").k:
-    keys("root.x", (1, CHOP_POS[0]))
-if T("root.y").k[0][0] > 1:
-    keys("root.y", (1, CHOP_POS[1]))
-
-_root_yaw_track = T("root.yaw")
+LAND_Z = JUMP_Z0 = 0.0  # уточняются по FK перед запеканием
 
 
 def steve_pose(f):
-    P = {}
-    for ch, tr in ST.items():
-        if ch == "root.yaw" and f < 200:
-            continue
-        if tr.k and tr.k[0][1] is None:
-            continue
-        P[ch] = tr(f)
-    P["root.x"], P["root.y"] = CHOP_POS
-    P["root.y"] = ST["root.y"](f)
-    P.setdefault("root.z", 0.0)
-    swing = 0.0
-    if f <= F_ARRIVE:
-        s, v = walk_s(f)
-        p, tan = STEVE_PATH.at(s)
-        P["root.x"], P["root.y"] = p.x, p.y
-        if f < 200:
-            P["root.yaw"] = yaw_to(tan.x, tan.y)
-        amp = v / _walk_v
-        ph = s / 0.82 * math.pi
-        swing = math.sin(ph) * amp
-        P["leg.L.fwd"] += 34 * swing
-        P["leg.R.fwd"] -= 34 * swing
-        P["arm.R.fwd"] += 26 * swing
-        P["arm.L.fwd"] -= 26 * swing
-        P["body.yaw"] += 4 * swing
-        P["head.yaw"] -= 3 * swing
-        P["root.z"] += 0.028 * (math.cos(2 * ph) + 1) / 2 * amp
-    if F_SPRINT <= f < F_BOOM:
-        p, v = sprint_pos(f)
-        P["root.x"], P["root.y"] = p.x, p.y
-        amp = s5(seg(f, F_SPRINT, F_SPRINT + 8))
-        dist = (p - Vector(CHOP_POS)).length
-        ph = dist / 1.15 * math.pi
-        sw = math.sin(ph) * amp
-        P["leg.L.fwd"] += 55 * sw
-        P["leg.R.fwd"] -= 55 * sw
-        P["arm.R.fwd"] += 62 * sw
-        P["arm.L.fwd"] -= 62 * sw
-        P["root.z"] += 0.05 * (math.cos(2 * ph) + 1) / 2 * amp
-    if f >= F_BOOM:
-        if f < F_LAND:
-            t = seg(f, F_BOOM, F_LAND)
-            a, b = Vector(SPRINT_END), Vector(LAND_POS)
-            p = a.lerp(b, 1 - (1 - t) ** 2)
-            P["root.x"], P["root.y"] = p.x, p.y
-            P["root.z"] = lerp(0, 0.25, t) + 8.4 * t * (1 - t) * 1.0 * (1 - 0.3 * t)
-        elif f < F_REST:
-            t = seg(f, F_LAND, F_REST)
-            p = Vector(LAND_POS).lerp(Vector(REST_POS), EASE["out"](t))
-            P["root.x"], P["root.y"] = p.x, p.y
-            P["root.z"] = 0.25 + 0.12 * math.sin(math.pi * seg(f, F_LAND, F_LAND + 6))
-        else:
-            P["root.x"], P["root.y"] = REST_POS
-            if f < 650:
-                P["root.z"] = 0.25
-        w = clamp(seg(f, F_BOOM, F_BOOM + 3)) * (1 - seg(f, F_LAND - 2, F_LAND + 6))
-        if w > 0:
-            P["arm.R.fwd"] = lerp(P["arm.R.fwd"], 130 + 40 * math.sin(f * 0.9), w)
-            P["arm.L.fwd"] = lerp(P["arm.L.fwd"], 120 + 40 * math.sin(f * 0.9 + 2.0), w)
-            P["arm.R.out"] = lerp(P["arm.R.out"], 30 + 18 * math.sin(f * 1.1), w)
-            P["arm.L.out"] = lerp(P["arm.L.out"], 30 + 18 * math.sin(f * 1.1 + 1), w)
-            P["leg.R.fwd"] = lerp(P["leg.R.fwd"], 35 * math.sin(f * 0.8), w)
-            P["leg.L.fwd"] = lerp(P["leg.L.fwd"], -35 * math.sin(f * 0.8), w)
-            P["root.roll"] = 14 * math.sin(f * 0.35) * w
-        if F_LAND - 2 <= f < 650:
-            q = seg(f, F_LAND - 2, F_LAND + 6)
-            for lb in ("arm.R", "arm.L"):
-                P[lb + ".fwd"] = lerp(P[lb + ".fwd"], 8, q) if f < 594 else P[lb + ".fwd"]
-            if f < 594:
-                P["leg.R.fwd"] = lerp(P["leg.R.fwd"], 0, q)
-                P["leg.L.fwd"] = lerp(P["leg.L.fwd"], 0, q)
-    # лёгкое «дыхание» рук, как в игре
-    idle = 1.0 - (1.0 if F_BOOM <= f < 664 else 0.0)
-    P["arm.R.out"] += idle * (math.cos(f * 0.09 * 0.833) * 2.8 + 2.8) * 0.5
-    P["arm.L.out"] += idle * (math.cos(f * 0.09 * 0.833) * 2.8 + 2.8) * 0.5
-    P["arm.R.fwd"] += idle * math.sin(f * 0.067 * 0.833) * 2.8 * 0.6
-    P["arm.L.fwd"] -= idle * math.sin(f * 0.067 * 0.833) * 2.8 * 0.6
+    P = st(f)
+    heavy = seg(f, 520, 530) * (1 - seg(f, 538, 548)) + seg(f, 600, 622)
+    br = math.sin(f * 2 * math.pi / (FPS * (3.4 - 1.6 * heavy)))
+    amp = 1.0 + 2.2 * heavy
+    P["chest.pitch"] += -1.1 * br * amp
+    P["arm.R.out"] += 0.9 * (br + 1) * amp
+    P["arm.L.out"] += 0.9 * (br + 1) * amp
+    P["head.pitch"] += 0.7 * br * amp
+    P["z"] += -0.004 * (br + 1) * amp
+    P["blink"] = max(P["blink"], blink_at(f, BLINKS_STEVE))
+    if F_JUMP <= f <= F_SLAM:
+        t = (f - F_JUMP) / float(F_SLAM - F_JUMP)
+        p = JUMP_FROM.lerp(JUMP_TO, s5(t) * 0.25 + t * 0.75)
+        P["x"], P["y"] = p.x, p.y
+        P["z"] = 4.6 * 4 * t * (1 - t) * (1 - 0.15 * t) + lerp(JUMP_Z0, LAND_Z, t)
+    if f >= F_SLAM:
+        P["x"], P["y"] = JUMP_TO.x, JUMP_TO.y
+    if F_BEAM <= f < F_BEAM_END:
+        j = 1.4 * math.sin(f * 2.7) + 1.1 * math.sin(f * 4.3)
+        P["arm.R.fwd"] += j
+        P["arm.L.fwd"] += j * 0.8
+        P["torso.pitch"] += 0.4 * j
+        P["head.roll"] += 0.6 * j
     return P
 
 
-# фиксируем первую точку поворота у остановки
-_yaw200 = None
-_s, _v = walk_s(200)
-_p, _tan = STEVE_PATH.at(_s)
-_yaw200 = yaw_to(_tan.x, _tan.y)
-ST["root.yaw"].k = [(200, _yaw200, "io") if k[0] == 200 else k for k in ST["root.yaw"].k]
-
-# шаги по траве
-_prev = None
-for f in range(F_START, F_ARRIVE + 1):
-    s, v = walk_s(f)
-    n = math.floor((s / 0.82 * math.pi - math.pi / 2) / math.pi)
-    if _prev is not None and n != _prev and v > 0.01:
-        cue(f, "step/grass%d" % R.randint(1, 6), 0.22 if f < 133 else 0.5)
-    _prev = n
-_prev = None
-for f in range(F_SPRINT, F_BOOM):
-    p, v = sprint_pos(f)
-    n = math.floor(((p - Vector(CHOP_POS)).length / 1.15 * math.pi - math.pi / 2) / math.pi)
-    if _prev is not None and n != _prev:
-        cue(f, "step/grass%d" % R.randint(1, 6), 0.6)
-    _prev = n
-for f in (668, 676, 680, 697, 701):
-    cue(f, "step/grass%d" % R.randint(1, 6), 0.45)
-
-# ----------------------------------------------------------- Creeper motion
-
-CREEP_V = CREEPER_PATH.length / ((F_CREEPER_STOP - F_CREEPER_IN) - 6.0)
+MENACE = {"arm.R.fwd": 0, "arm.R.out": 2.5, "arm.R.bend": 0, "arm.L.fwd": 0, "arm.L.out": 2.5, "arm.L.bend": 0,
+          "head.pitch": 7, "head.yaw": 0, "torso.pitch": 0, "chest.pitch": 0, "chest.yaw": 0, "torso.yaw": 0,
+          "leg.R.fwd": 0, "leg.L.fwd": 0, "leg.R.bend": 0, "leg.L.bend": 0, "z": 0.0}
+WIND = {"arm.R.fwd": -38, "arm.R.bend": 70, "arm.R.out": 12, "chest.yaw": -26, "torso.yaw": -10, "torso.pitch": 6,
+        "leg.R.fwd": -16, "leg.R.bend": 8, "leg.L.fwd": 20, "leg.L.bend": 18, "head.pitch": 2, "z": 0.0}
+PUNCH = {"arm.R.fwd": 86, "arm.R.bend": 4, "arm.R.out": -8, "chest.yaw": 24, "torso.yaw": 8, "torso.pitch": 12,
+         "leg.R.fwd": -30, "leg.R.bend": 4, "leg.L.fwd": 30, "leg.L.bend": 30, "z": -0.06, "head.pitch": -2,
+         "arm.L.fwd": -24, "arm.L.out": 14, "arm.L.bend": 30}
+LANDH = dict(MENACE, **{"z": -0.18, "leg.R.bend": 40, "leg.L.bend": 44, "leg.L.fwd": 20, "leg.R.fwd": -10,
+                        "torso.pitch": 18, "arm.R.out": 30, "arm.L.out": 30, "arm.R.bend": 20, "arm.L.bend": 20})
+CHARGE = {"arm.R.fwd": 88, "arm.R.out": -4, "arm.R.bend": 0, "arm.R.twist": 90, "arm.L.fwd": 76, "arm.L.out": -34,
+          "arm.L.bend": 44, "leg.R.fwd": -22, "leg.R.bend": 14, "leg.L.fwd": 24, "leg.L.bend": 20, "z": -0.06,
+          "torso.pitch": 6, "chest.yaw": 8, "head.pitch": 1, "torso.yaw": 0}
 
 
-def creeper_s(f):
-    t_c = F_CREEPER_STOP - 12
-    if f <= t_c:
-        return CREEP_V * max(0, f - F_CREEPER_IN), CREEP_V
-    tt = min(f, F_CREEPER_STOP) - t_c
-    return CREEP_V * (t_c - F_CREEPER_IN) + CREEP_V * (tt - tt * tt / 24.0), CREEP_V * max(0.0, 1 - tt / 12.0)
+def mirror(pose):
+    out = {}
+    for k, v in pose.items():
+        k2 = k.replace(".R.", ".#.").replace(".L.", ".R.").replace(".#.", ".L.")
+        out[k2] = -v if k2.endswith((".yaw", ".roll")) else v
+    return out
 
 
-def swell(f):
-    return clamp((f - F_HISS) / float(F_BOOM - F_HISS))
+# бьёт левой: напротив стоящего Стива она приходится как раз на меч в его правой руке
+WIND_L, PUNCH_L = mirror(WIND), mirror(PUNCH)
 
 
-def look(src, eye_z, yaw_body, tgt):
-    d = tgt - Vector((src[0], src[1], eye_z))
-    yaw = unwrap(0, yaw_to(d.x, d.y) - yaw_body)
-    pitch = -math.degrees(math.atan2(d.z, max(0.01, d.xy.length)))
-    return clamp(yaw, -70, 70), clamp(pitch, -50, 60)
+def make_hero_anim(h1, punch_fwd, yaw_c):
+    a = Anim(L.POSE_DEFAULTS)
+    a.defaults.update({"x": FH.x, "y": FH.y, "z": FH_Z, "yaw": YAW_H})
+    a.K(1, dict(MENACE, z=FH_Z))
+    a.K(1, {"x": FH.x, "y": FH.y, "glow": 0.0, "yaw": YAW_H})
+    a.K(F_EYES, glow=0.0)
+    a.K(F_EYES + 4, glow=0.4, e="out")
+    a.K(F_EYES + 7, glow=0.08, e="in")
+    a.K(F_EYES + 11, glow=0.75, e="out")
+    a.K(F_EYES + 13, glow=0.45)
+    a.K(F_EYES + 22, glow=1.0, e="out")
+    a.K(250, head__pitch=7)
+    a.K(304, head__pitch=-2, e="io")
+    a.K(380, head__pitch=-2)
+    # телепорт к Стиву (скрыт 386–391), удар 392–400
+    a.K(388, {"x": FH.x, "y": FH.y, "z": FH_Z}, e="const")
+    a.K(389, dict(WIND_L, x=h1.x, y=h1.y, yaw=yaw_c), e="const")
+    a.K(392, WIND_L)
+    punch = dict(PUNCH_L, **{"arm.L.fwd": punch_fwd})
+    a.K(400, punch, e="in")
+    a.K(436, dict(punch, **{"arm.L.fwd": punch_fwd - 6, "torso.pitch": 15, "glow": 1.35}), e="io")
+    a.K(440, dict(punch, **{"z": -0.22, "leg.R.bend": 50, "leg.L.bend": 40, "torso.pitch": 20, "arm.L.fwd": 30,
+                            "arm.L.bend": 30, "glow": 1.0}), e="io")
+    a.K(440, {"x": h1.x, "y": h1.y, "yaw": yaw_c})
+    a.K(452, {"x": H2.x, "y": H2.y, "yaw": YAW_H}, e="out")
+    a.K(446, dict(LANDH, z=0.9, **{"leg.R.bend": 70, "leg.L.bend": 80, "leg.R.fwd": 40, "leg.L.fwd": 50}), e="out")
+    a.K(452, LANDH, e="in")
+    a.K(466, CHARGE, e="io")
+    a.K(466, glow=1.0)
+    a.K(494, dict(CHARGE, glow=1.9), e="in")
+    a.K(F_BEAM, {"x": H2.x, "y": H2.y})
+    a.K(F_BEAM + 6, dict(CHARGE, **{"torso.pitch": -4, "x": (H2 + D * 0.18).x, "y": (H2 + D * 0.18).y}), e="out")
+    a.K(F_BEAM_END, dict(CHARGE, glow=1.6))
+    a.K(534, dict(MENACE, **{"x": (H2 + D * 0.18).x, "y": (H2 + D * 0.18).y, "glow": 1.2}), e="io")
+    a.K(548, dict(MENACE, **{"head.pitch": -4}))
+    a.K(563, {"head.pitch": -38, "torso.pitch": -6}, e="io")
+    a.K(571, {"glow": 1.3})
+    a.K(574, {"glow": 2.4}, e="in")
+    # финал: глаза в темноте позади Стива
+    a.K(640, dict(MENACE, **{"x": HB_END.x, "y": HB_END.y, "z": 0.0, "glow": 0.0}), e="const")
+    a.K(640, {"yaw": yaw_to((JUMP_TO - HB_END).x, (JUMP_TO - HB_END).y)}, e="const")
+    a.K(F_EYES2, glow=0.0)
+    a.K(F_EYES2 + 6, glow=0.55, e="out")
+    a.K(F_EYES2 + 8, glow=0.3)
+    a.K(F_EYES2 + 16, glow=1.1, e="out")
+    return a
 
 
-def steve_head_pos(f):
-    P = steve_pose(f)
-    return Vector((P["root.x"], P["root.y"], 1.65 + P["root.z"]))
+HB_Z440 = HB_Z452 = 0.0
 
 
-CR_POSES = {}
-_cy = None
-_hy = _hp = 0.0
-for f in range(F_START, F_END + 1):
-    P = {}
-    if f < F_CREEPER_IN:
-        p, tan = CREEPER_PATH.at(0)
-        x, y = p.x, p.y
-        yaw = yaw_to(tan.x, tan.y)
-        speed = 0.0
-        dist = 0.0
-    elif f <= F_CREEPER_STOP:
-        s, speed = creeper_s(f)
-        p, tan = CREEPER_PATH.at(s)
-        x, y = p.x, p.y
-        yaw = yaw_to(tan.x, tan.y)
-        dist = s
-    else:
-        t = s5(seg(f, 535, 548))
-        p = Vector(CREEPER_END).lerp(Vector(CREEPER_SHUFFLE), t)
-        x, y = p.x, p.y
-        sh = steve_head_pos(f)
-        yaw = yaw_to(sh.x - x, sh.y - y)
-        speed = 0.04 * math.sin(math.pi * seg(f, 535, 548))
-        dist = CREEPER_PATH.length + (p - Vector(CREEPER_END)).length
-    _cy = yaw if _cy is None else _cy + (unwrap(_cy, yaw) - _cy) * 0.18
-    P["root.x"], P["root.y"], P["root.z"], P["root.yaw"] = x, y, 0.0, _cy
-    hy, hp = look((x, y), 1.4, _cy, steve_head_pos(f))
-    if f < 400:
-        hy, hp = hy * 0.3, 6
-    _hy += (hy - _hy) * 0.2
-    _hp += (hp - _hp) * 0.2
-    P["head.yaw"], P["head.pitch"] = _hy, _hp
-    ph = dist / 0.55 * math.pi
-    amp = clamp(speed / CREEP_V * 1.3) if f <= F_CREEPER_STOP else clamp(speed * 25)
-    sw = 28 * math.sin(ph) * amp
-    P["leg.FR.fwd"], P["leg.BL.fwd"], P["leg.FL.fwd"], P["leg.BR.fwd"] = sw, sw, -sw, -sw
-    # раздувание, как CreeperRenderer.scale()
-    sf = swell(f)
-    g = 1.0 + math.sin(sf * 100.0) * sf * 0.01
-    sf3 = sf ** 3
-    P["sx"] = (1.0 + sf3 * 0.4) * g
-    P["sz"] = (1.0 + sf3 * 0.1) / g
-    P["flash"] = 0.0 if (sf <= 0 or int(sf * 10) % 2 == 0) else clamp(sf, 0.5, 1.0)
-    CR_POSES[f] = P
-
-cue(F_HISS, "random/fuse", 1.0)
-cue(F_BOOM, "random/explode%d" % R.randint(1, 4), 1.0, channel=3)
-cue(F_BOOM + 1, "random/explode%d" % R.randint(1, 4), 0.55, channel=4)
-cue(F_BOOM + 2, "damage/hit%d" % R.randint(1, 3), 0.8)
-cue(F_LAND, "damage/fallsmall", 0.8)
-cue(F_PICKUP + 1, "random/pop", 0.45)
-cue(F_START, "music/game/sweden", 0.5, channel=1,
-    duration=30.5, volume_keys=[[1, 0.0], [36, 0.5], [470, 0.5], [500, 0.0], [640, 0.0], [690, 0.42], [720, 0.0]])
-
-# ----------------------------------------------------------------- baking
+def hero_pose(f):
+    P = hb(f)
+    if 440 <= f <= 452:
+        t = (f - 440) / 12.0
+        P["z"] = 1.15 * 4 * t * (1 - t) + lerp(HB_Z440, HB_Z452, t)
+    if 466 <= f < F_BEAM_END:
+        amp = 0.6 + 2.0 * seg(f, 470, 494) + 1.5 * (F_BEAM <= f)
+        j = math.sin(f * 3.1) + 0.7 * math.sin(f * 5.3)
+        P["arm.R.fwd"] += amp * j
+        P["arm.L.fwd"] += amp * j * 0.7
+    return P
 
 
-def bake_rig(rig, pose_fn, limbs):
-    pbs = rig.pose.bones
-    interp("LINEAR")
-    for f in range(F_START, F_END + 1):
-        P = pose_fn(f)
-        r = pbs["root"]
-        r.location = (P["root.x"], P["root.y"], P["root.z"])
-        r.rotation_euler = (rad(P.get("root.pitch", 0)), rad(P.get("root.roll", 0)), rad(P["root.yaw"]))
-        r.keyframe_insert("location", frame=f, group="root")
-        r.keyframe_insert("rotation_euler", frame=f, group="root")
-        if "sx" in P:
-            r.scale = (P["sx"], P["sx"], P["sz"])
-            r.keyframe_insert("scale", frame=f, group="root")
-        for b in ("body", "head"):
-            if b + ".pitch" in P or b + ".yaw" in P:
-                pb = pbs[b]
-                pb.rotation_euler = (rad(P.get(b + ".pitch", 0)), rad(P.get(b + ".yaw", 0)), rad(P.get(b + ".roll", 0)))
-                pb.keyframe_insert("rotation_euler", frame=f, group=b)
-        for lb, sign in limbs:
-            pb = pbs[lb]
-            pb.rotation_euler = (rad(-P.get(lb + ".fwd", 0)), 0.0, rad(sign * P.get(lb + ".out", 0)))
-            pb.keyframe_insert("rotation_euler", frame=f, group=lb)
+def steve_ground(f, P):
+    if F_JUMP + 1 <= f < F_SLAM:
+        return None
+    return vox.top_z(P["x"], P["y"], CRATER if f >= F_SLAM else frozenset())
 
 
-print("[build] baking animation...")
-bake_rig(steve_rig, steve_pose, [("arm.R", 1), ("arm.L", -1), ("leg.R", 1), ("leg.L", -1)])
-bake_rig(creeper_rig, lambda f: CR_POSES[f], [("leg.FR", 1), ("leg.FL", -1), ("leg.BR", 1), ("leg.BL", -1)])
-key_prop(creeper, "flash", [(f, CR_POSES[f]["flash"]) for f in range(F_START, F_END + 1)])
-key_vis(creeper, [(F_CREEPER_IN - 1, F_BOOM)])
-creeper_rig.hide_viewport = False
-
-# ----------------------------------------------------------- particles / FX
-
-GRAV = 16.0  # блоков/с², как у частиц в игре
+def hero_ground(f, P):
+    if 440 < f < 452:
+        return None
+    return vox.top_z(P["x"], P["y"], CRATER if f >= F_SLAM else frozenset())
 
 
-def mini_cube(name, size, mats, uv_rect=None, collection=C_FX):
-    """mats: (side, top). uv_rect: (u0, v0, u1, v1) — кусочек текстуры для частиц."""
-    mb = MB()
-    h = size / 2
-    uvs = UV_FULL
-    if uv_rect:
-        u0, v0, u1, v1 = uv_rect
-        uvs = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
-    for d in DIRS:
-        mb.quad(face_pts(d, (-h, -h, -h), (h, h, h)), uvs, mats[1] if d in ("+z", "-z") else mats[0])
-    return mb.build(name, collection)
+def blade_point(frame, along):
+    scene.frame_set(frame)
+    return sword.matrix_world @ (Vector((1, 0, 1)).normalized() * (1.13 * along))
 
 
-def ground_z(x, y, removed):
-    bx, by = math.floor(x), math.floor(y)
-    for z in range(12, ZMIN - 1, -1):
-        p = (bx, by, z)
-        if p in blocks and p not in removed and blocks[p] in OPAQUE | LEAVES:
-            return z + 1.0
-    return ZMIN
+def fist_of(ch, P, side="L"):
+    L.apply_pose(ch, P)
+    bpy.context.view_layer.update()
+    pb = ch.rig.pose.bones["fore." + side]
+    return ch.rig.matrix_world @ pb.matrix @ Vector(((-1.0 if side == "R" else 1.0) * ch.px, pb.length + 0.5 * ch.px, 0))
 
 
-def bake_ballistic(obj, f0, f_end, pos, vel, half, removed, spin=None, item=False, f_pick=None, pick_to=None):
-    """Покадровая физика: гравитация, удар о землю, предмет — покачивание и вращение."""
-    interp("LINEAR")
-    p = Vector(pos)
-    v = Vector(vel)
-    rot = Vector((0, 0, R.random() * 6.28))
-    landed = False
-    dt = 1.0 / FPS
-    for f in range(f0, f_end + 1):
-        if f_pick and f >= f_pick:
-            t = seg(f, f_pick, f_pick + 3)
-            p = p.lerp(pick_to(f), t)
-        elif not landed:
-            v.z -= GRAV * dt
-            p += v * dt
-            gz = ground_z(p.x, p.y, removed) + half
-            if p.z <= gz:
-                p.z = gz
-                if abs(v.z) > 2.0 and not item:
-                    v.z = -v.z * 0.3
-                    v.x *= 0.5
-                    v.y *= 0.5
-                else:
-                    landed = True
-                    v = Vector((0, 0, 0))
-                    land_f = f
-            if spin:
-                rot += Vector(spin) * dt
-        if item:
-            age = f - f0
-            obj.location = p + Vector((0, 0, (math.sin(age / 10.0 * 0.833) * 0.1 + 0.1) if landed else 0))
-            obj.rotation_euler = (0, 0, rot.z + age * 0.05 * 0.833)
-        else:
-            obj.location = p
-            obj.rotation_euler = rot
-        obj.keyframe_insert("location", frame=f)
-        obj.keyframe_insert("rotation_euler", frame=f)
+print("[build] baking...")
+JUMP_Z0 = vox.top_z(JUMP_FROM.x, JUMP_FROM.y) - L.foot_clearance(steve, steve_pose(F_JUMP))
+LAND_Z = vox.top_z(JUMP_TO.x, JUMP_TO.y) - L.foot_clearance(steve, steve_pose(F_SLAM))
+L.bake_character(steve, steve_pose, F0, F1, ground_fn=steve_ground,
+                 springs={"head.yaw": (0.32, 0.62), "head.pitch": (0.32, 0.62), "chest.yaw": (0.36, 0.7),
+                          "arm.L.fwd": (0.4, 0.72), "arm.L.out": (0.4, 0.72)})
+bake_grip(sword, steve, lambda f: steve_pose(f)["grip"], range(F0, F1 + 1))
+key_vis(sword, [(F_DRAW - 1, F1 + 10)])
+
+# удар в землю: угол меча в ладони такой, чтобы остриё вошло в землю перед Стивом; там и воронка
+def tip_for_grip(g):
+    loc, q, _ = item_basis(steve, g).decompose()
+    sword.location, sword.rotation_quaternion = loc, q
+    bpy.context.view_layer.update()
+    return sword.matrix_world @ (Vector((1, 0, 1)).normalized() * 1.13)
 
 
-log_mats = (M["oak_log"], M["oak_log_top"])
-bc = Vector((CHOP_BLOCK[0] + 0.5, CHOP_BLOCK[1] + 0.5, CHOP_BLOCK[2] + 0.5))
+scene.frame_set(F_SLAM)
+_cands = []
+for g in range(30, 151, 2):
+    tp = tip_for_grip(g)
+    _cands.append((g, tp, (tp.xy - JUMP_TO).dot(D)))
+_ok = [c for c in _cands if -0.15 <= c[1].z <= 0.12 and c[2] > 0.6]
+G_SLAM, _tip, _ahead = max(_ok, key=lambda c: c[2]) if _ok else min(_cands, key=lambda c: abs(c[1].z))
+for f_, e_ in ((578, "in"), (582, "out"), (586, "out"), (600, "io")):
+    st.tr("grip").add(f_, G_SLAM, e_)
+bake_grip(sword, steve, lambda f: steve_pose(f)["grip"], range(F0, F1 + 1))
+build_crater(Vector((_tip.x, _tip.y)) + D * max(0.0, 1.3 - _ahead))
+print("[build] slam grip", G_SLAM, "tip", tuple(round(c, 2) for c in _tip), "ahead", round(_ahead, 2), "crater", len(CRATER))
 
-# частицы от ударов
-for i, c in enumerate(CONTACTS[:-1]):
-    for j in range(3):
-        u0, v0 = R.randint(0, 12) / 16, R.randint(0, 12) / 16
-        size = R.uniform(0.06, 0.1)
-        ob = mini_cube("HitBit_%d_%d" % (i, j), size, log_mats, (u0, v0, u0 + 4 / 16, v0 + 4 / 16))
-        life = R.randint(10, 18)
-        pos = (bc.x + R.uniform(-0.3, 0.3), CHOP_BLOCK[1] - 0.02, bc.z + R.uniform(0.1, 0.45))
-        vel = (R.uniform(-1.2, 1.2), R.uniform(-1.8, -0.6), R.uniform(1.0, 3.0))
-        bake_ballistic(ob, c, c + life, pos, vel, size / 2, REMOVED_A, spin=(R.uniform(-9, 9), R.uniform(-9, 9), 0))
-        key_vis(ob, [(c, c + life)])
+# контакт: левый кулак Herobrine в клинок на кадре удара
+scene.frame_set(F_CLASH)
+_bm = sword.matrix_world.copy()
+_blade = [(i / 20.0, _bm @ (Vector((1, 0, 1)).normalized() * 1.13 * i / 20.0)) for i in range(8, 20)]
+H1 = S_STEP + D * 1.25
+punch_fwd = 86.0
+yaw_c = YAW_H
+hb = make_hero_anim(H1, punch_fwd, yaw_c)
+P_ = hero_pose(F_CLASH)
+P_["z"] = hero_ground(F_CLASH, P_) - L.foot_clearance(hero, P_)
+_znat = fist_of(hero, P_).z
+_along, CLASH_T = min(_blade, key=lambda b: abs(b[1].z - _znat))
+for _ in range(10):
+    yaw_c = L.unwrap(YAW_H, yaw_to((S_STEP - H1).x, (S_STEP - H1).y))
+    hb = make_hero_anim(H1, punch_fwd, yaw_c)
+    P_ = hero_pose(F_CLASH)
+    P_["z"] = hero_ground(F_CLASH, P_) - L.foot_clearance(hero, P_)
+    err = CLASH_T - fist_of(hero, P_)
+    H1 = H1 + err.xy
+    punch_fwd = clamp(punch_fwd + math.degrees(err.z / 0.62), 70.0, 115.0)
+hb = make_hero_anim(H1, punch_fwd, yaw_c)
+print("[build] clash target along", _along, "z", round(CLASH_T.z, 2), "natural fist z", round(_znat, 2),
+      "blade z", round(_blade[0][1].z, 2), "..", round(_blade[-1][1].z, 2))
+HB_Z440 = vox.top_z(H1.x, H1.y) - L.foot_clearance(hero, hero_pose(440))
+HB_Z452 = vox.top_z(H2.x, H2.y) - L.foot_clearance(hero, hero_pose(452))
+L.bake_character(hero, hero_pose, F0, F1, springs={"head.pitch": (0.3, 0.65)}, ground_fn=hero_ground)
+for ob in (hero.mesh, hero.face):
+    key_vis(ob, [(F_BOLT, F_TP_OUT), (F_TP_IN, F_VANISH), (F_EYES2 - 2, F1 + 10)])
 
-# разрушение блока: сетка 4x4x4 частиц, как в ParticleEngine.destroy
-n = 0
-for ix in range(4):
-    for iy in range(4):
-        for iz in range(4):
-            if R.random() > 0.55:
-                continue
-            o = Vector(((ix + 0.5) / 4, (iy + 0.5) / 4, (iz + 0.5) / 4))
-            pos = Vector(CHOP_BLOCK) + o
-            u0, v0 = R.randint(0, 12) / 16, R.randint(0, 12) / 16
-            size = R.uniform(0.08, 0.15)
-            ob = mini_cube("BreakBit_%02d" % n, size, log_mats, (u0, v0, u0 + 4 / 16, v0 + 4 / 16))
-            n += 1
-            vel = (o - Vector((0.5, 0.5, 0.5))) * R.uniform(3, 6) + Vector((0, 0, R.uniform(1.5, 3.5)))
-            life = R.randint(14, 30)
-            bake_ballistic(ob, F_BREAK, F_BREAK + life, pos, vel, size / 2, REMOVED_A,
-                           spin=(R.uniform(-12, 12), R.uniform(-12, 12), R.uniform(-6, 6)))
-            key_vis(ob, [(F_BREAK, F_BREAK + life)])
-
-# выпавшее бревно -> подбор
-drop = mini_cube("Drop_OakLog", 0.25, log_mats)
-bake_ballistic(drop, F_BREAK, F_PICKUP + 3, bc, (0.4, -0.6, 2.2), 0.125, REMOVED_A, item=True,
-               f_pick=F_PICKUP - 1, pick_to=lambda f: steve_head_pos(f) - Vector((0, 0, 0.7)))
-key_vis(drop, [(F_BREAK, F_PICKUP + 2)])
-
-# взрыв: вспышка, частицы explosion_*, обломки-предметы, дым
-cam_objs = {}
-mat_expl = mat_sprite("mc_explosion", ATLAS_EXPL, 16, emit=1.2)
-mat_smoke = mat_sprite("mc_big_smoke", ATLAS_SMOKE, 12, emit=0.0)
+# ----------------------------------------------------------- probe helpers
 
 
-def sprite(name, mat):
-    mb = MB()
-    mb.quad([(-0.5, -0.5, 0), (0.5, -0.5, 0), (0.5, 0.5, 0), (-0.5, 0.5, 0)], UV_FULL, mat)
-    ob = mb.build(name, C_FX)
-    ob.visible_shadow = False
+def bone_world(ch, bone, tail=True, frame=None):
+    if frame is not None:
+        scene.frame_set(frame)
+    pb = ch.rig.pose.bones[bone]
+    return ch.rig.matrix_world @ (pb.tail if tail else pb.head)
+
+
+def sword_point(frame, along=0.5):
+    scene.frame_set(frame)
+    blade = Vector((1, 0, 1)).normalized() * (0.98 * along)
+    return sword.matrix_world @ blade
+
+
+def hand_point(ch, side, frame):
+    scene.frame_set(frame)
+    pb = ch.rig.pose.bones["fore." + side]
+    m = ch.rig.matrix_world @ pb.matrix
+    return m @ Vector((-1.0 * ch.px if side == "R" else 1.0 * ch.px, pb.length + 0.5 * ch.px, 0))
+
+
+# ----------------------------------------------------------------- FX
+
+print("[build] fx...")
+FXR = random.Random(77)
+
+
+def fx_mat(name, color, strength, fade=True):
+    return L.mat_emit(name, color, strength, alpha_from_fade=fade)
+
+
+MAT_SPARK = fx_mat("fx_spark", (1.0, 0.75, 0.42), 14.0)
+MAT_CYAN = fx_mat("fx_energy", (0.45, 0.88, 1.0), 9.0)
+MAT_WHITE = fx_mat("fx_white", (0.9, 0.96, 1.0), 14.0)
+MAT_ENDER = fx_mat("fx_ender", (0.62, 0.32, 1.0), 14.0)
+MAT_DUST = new_material("fx_dust")
+_t = NT(MAT_DUST)
+_t.out(_t.mixs(_t.math("MULTIPLY", _t.attr("fade"), 0.85), _t.transparent(),
+               _t.principled((0.32, 0.30, 0.28), rough=1.0, spec=0.0)))
+ME_CUBE = {k: L.cube_mesh("fx_cube_" + k, 1.0, m) for k, m in
+           (("spark", MAT_SPARK), ("cyan", MAT_CYAN), ("white", MAT_WHITE), ("ender", MAT_ENDER), ("dust", MAT_DUST))}
+
+
+def particle(kind, name, f0, positions, size, shrink=True, glow=1.0, rot=None, stretch=None):
+    ob = L.fx_object(name, ME_CUBE[kind], C_FX, glow=glow)
+    n = len(positions)
+    scales = []
+    for i in range(n):
+        k = 1.0 - (i / max(1, n - 1)) if shrink else 1.0
+        s = size * (0.25 + 0.75 * k)
+        scales.append((s, s, s * stretch) if stretch else s)
+    L.bake_points(ob, list(zip(range(f0, f0 + n), positions)), rot=rot, scale=scales)
+    key_vis(ob, [(f0, f0 + n)])
     return ob
 
 
-SPRITES = []
-for i in range(40):
-    f0 = F_BOOM + int(i / 40 * 10)
-    life = int(R.uniform(6, 10) * 1.2)
-    ob = sprite("Explosion_%02d" % i, mat_expl)
-    pos = EXPL_C + Vector((R.uniform(-1, 1) * 2.4, R.uniform(-1, 1) * 2.4, R.uniform(-0.6, 1.6)))
-    ob.location = pos
-    size = 2.0 * (1.0 - R.random() * 0.5) * 2
-    ob.scale = (size, size, size)
-    gray = R.random() * 0.4 + 0.6
-    key_prop(ob, "tint", [(F_START, gray)])
-    key_prop(ob, "fade", [(F_START, 1.0)])
-    key_prop(ob, "sprite_frame", [(f0 + k, min(15, int(k * 16 / life))) for k in range(life + 1)])
-    key_vis(ob, [(f0, f0 + life)])
-    SPRITES.append(ob)
+def burst(center, count, kind, f0, life=(12, 22), speed=(1.0, 3.0), size=(0.05, 0.12), implode=False,
+          height=1.8, gravity=0.0, tag="burst"):
+    for i in range(count):
+        dvec = Vector((FXR.gauss(0, 1), FXR.gauss(0, 1), FXR.gauss(0, 0.6))).normalized()
+        start = Vector(center) + Vector((FXR.uniform(-0.25, 0.25), FXR.uniform(-0.25, 0.25), FXR.uniform(0, height)))
+        n = FXR.randint(*life)
+        v = dvec * FXR.uniform(*speed)
+        pts = []
+        p = start.copy()
+        vv = v.copy()
+        for k in range(n):
+            pts.append(p.copy())
+            dt = tscale(f0 + k) / FPS
+            vv *= (1 - 2.2 * dt)
+            vv.z -= gravity * dt
+            p += vv * dt
+        if implode:
+            pts = list(reversed(pts))
+        particle(kind, "%s_%03d" % (tag, i), f0 if not implode else f0, pts, FXR.uniform(*size), shrink=not implode)
 
-for i in range(16):
-    f0 = F_BOOM + 4 + R.randint(0, 24)
-    life = R.randint(70, 130)
-    ob = sprite("Smoke_%02d" % i, mat_smoke)
-    start = EXPL_C + Vector((R.uniform(-1.5, 1.5), R.uniform(-1.5, 1.5), R.uniform(0.0, 1.2)))
-    drift = Vector((R.uniform(-0.6, 1.2), R.uniform(-0.4, 0.4), R.uniform(2.0, 3.5)))
+
+def sparks(at, count, f0, base_dir, spread=0.9, speed=(3, 7), life=(8, 15), tag="spark"):
+    for i in range(count):
+        dvec = (Vector(base_dir).normalized() + Vector((FXR.gauss(0, spread), FXR.gauss(0, spread),
+                                                       FXR.gauss(0, spread) + 0.3))).normalized()
+        v = dvec * FXR.uniform(*speed)
+        n = FXR.randint(*life)
+        pts = L.ballistic(at, v, range(f0, f0 + n), grav=9.0, time_scale=tscale)
+        q = dvec.to_track_quat("Z", "Y").to_euler()
+        particle("spark", "%s_%03d" % (tag, i), f0, pts, FXR.uniform(0.018, 0.03), rot=[q] * n, stretch=5.0)
+
+
+def ring(name, center, normal, f0, dur, r_end, kind="cyan", thick=0.12, height=0.0):
+    segs = 56
+    mb = MB()
+    mat = {"cyan": MAT_CYAN, "white": MAT_WHITE, "dust": MAT_DUST}[kind]
+    for i in range(segs):
+        a0, a1 = 2 * math.pi * i / segs, 2 * math.pi * (i + 1) / segs
+        r0, r1 = 1.0 - thick, 1.0
+        pts = [(r0 * math.cos(a0), r0 * math.sin(a0), 0), (r1 * math.cos(a0), r1 * math.sin(a0), 0),
+               (r1 * math.cos(a1), r1 * math.sin(a1), height), (r0 * math.cos(a1), r0 * math.sin(a1), height)]
+        pts = [pts[0], pts[1], (r1 * math.cos(a1), r1 * math.sin(a1), 0), (r0 * math.cos(a1), r0 * math.sin(a1), 0)]
+        mb.quad(pts, UV_FULL, mat)
+    ob = mb.build(name, C_FX)
+    ob.visible_shadow = False
+    ob["glow"] = 1.0
+    ob.location = center
+    ob.rotation_euler = Vector(normal).to_track_quat("Z", "Y").to_euler()
     interp("LINEAR")
-    for k in (0, life // 2, life):
-        t = k / life
-        ob.location = start + drift * (1 - (1 - t) ** 2)
-        s = lerp(1.6, 3.6, t)
+    real = []
+    tt = 0.0
+    f = f0
+    while tt < dur:
+        real.append((f, tt / dur))
+        tt += tscale(f)
+        f += 1
+    real.append((f, 1.0))
+    for fr, k in real:
+        s = lerp(0.15, r_end, 1 - (1 - k) ** 3)
         ob.scale = (s, s, s)
-        ob.keyframe_insert("location", frame=f0 + k)
-        ob.keyframe_insert("scale", frame=f0 + k)
-    key_prop(ob, "tint", [(F_START, R.uniform(0.55, 0.75))])
-    key_prop(ob, "fade", [(f0, 0.0), (f0 + 6, 0.5), (f0 + life * 0.6, 0.3), (f0 + life, 0.0)], kind="LINEAR")
-    key_prop(ob, "sprite_frame", [(f0 + k, min(11, int(k * 12 / life))) for k in range(0, life + 1, 4)])
-    key_vis(ob, [(f0, f0 + life)])
-    SPRITES.append(ob)
+        ob.keyframe_insert("scale", frame=fr)
+    key_prop(ob, "fade", [(fr, (1 - k) ** 1.5) for fr, k in real], kind="LINEAR")
+    key_vis(ob, [(f0, real[-1][0])])
+    return ob
 
-DEBRIS_TYPES = {"grass": (M["grass_side"], M["grass_top"]), "dirt": (M["dirt"], M["dirt"]),
-                "stone": (M["stone"], M["stone"]), "oak_leaves": (M["oak_leaves"], M["oak_leaves"])}
-crater_list = sorted(CRATER)
-R.shuffle(crater_list)
-nd = 0
-for p in crater_list:
-    b = blocks[p]
-    if b not in DEBRIS_TYPES or nd >= 12:
-        continue
-    ob = mini_cube("Debris_%02d" % nd, 0.25, DEBRIS_TYPES[b])
-    pos = Vector(p) + Vector((0.5, 0.5, 0.5))
-    out = (pos - EXPL_C)
-    out.z = 0
-    out = out.normalized() if out.length > 0.01 else Vector((1, 0, 0))
-    vel = out * R.uniform(2.5, 5.5) + Vector((0, 0, R.uniform(4.0, 7.0)))
-    bake_ballistic(ob, F_BOOM, F_END, pos, vel, 0.125, REMOVED_B, item=True)
-    key_vis(ob, [(F_BOOM, F_END + 10)])
-    nd += 1
 
-flash = bpy.data.lights.new("ExplosionFlash", "POINT")
-flash.color = (1.0, 0.78, 0.5)
-flash.shadow_soft_size = 1.5
-flash_obj = link(bpy.data.objects.new("ExplosionFlash", flash), C_LIGHT)
-flash_obj.location = EXPL_C + Vector((0, 0, 0.8))
-interp("BEZIER")
-for f, e in ((F_START, 0), (F_BOOM - 1, 0), (F_BOOM, 60000), (F_BOOM + 3, 25000), (F_BOOM + 14, 0)):
-    flash.energy = e
+def block_debris(name, center, count, f0, removed, vel=(2.5, 5.5), up=(4.0, 7.5), size=(0.22, 0.38), radius=1.6,
+                 types=("grass", "dirt", "dirt", "stone")):
+    mats = {"grass": (M["grass_side"], M["grass_top"]), "dirt": (M["dirt"], M["dirt"]),
+            "stone": (M["stone"], M["stone"]), "cobblestone": (M["cobblestone"], M["cobblestone"])}
+    for i in range(count):
+        kind = FXR.choice(types)
+        s = FXR.uniform(*size)
+        mb = MB()
+        u0, v0 = FXR.randint(0, 8) / 16, FXR.randint(0, 8) / 16
+        uv = [(u0, v0), (u0 + 0.5, v0), (u0 + 0.5, v0 + 0.5), (u0, v0 + 0.5)]
+        side, top = mats[kind]
+        for d in DIRS:
+            mb.quad(face_pts(d, (-s / 2, -s / 2, -s / 2), (s / 2, s / 2, s / 2)), uv, top if d == "+z" else side)
+        ob = mb.build("%s_%02d" % (name, i), C_FX)
+        a = FXR.uniform(0, 2 * math.pi)
+        r = FXR.uniform(0.2, radius)
+        p0 = Vector(center) + Vector((math.cos(a) * r, math.sin(a) * r, FXR.uniform(-0.3, 0.2)))
+        out = Vector((math.cos(a), math.sin(a), 0))
+        v = out * FXR.uniform(*vel) + Vector((0, 0, FXR.uniform(*up)))
+        frames = range(f0, F1 + 1)
+        pts = L.ballistic(p0, v, frames, ground=lambda x, y: vox.top_z(x, y, removed), half=s / 2,
+                          time_scale=tscale)
+        spin = Vector((FXR.uniform(-9, 9), FXR.uniform(-9, 9), FXR.uniform(-5, 5)))
+        rots, ang = [], Vector((0, 0, FXR.uniform(0, 6)))
+        for k, fr in enumerate(frames):
+            if k > 0 and (pts[k] - pts[k - 1]).length > 1e-4:
+                ang = ang + spin * tscale(fr) / FPS
+            rots.append(ang.copy())
+        L.bake_points(ob, list(zip(frames, pts)), rot=rots)
+        key_vis(ob, [(f0, F1 + 10)])
+
+
+# --- молния (ванильная — набор светящихся «коробок»), вспышка, небо
+BOLT_BASE = Vector((FH.x, FH.y, FH_Z)) + v3(D) * 4.5 - v3(RV) * 3.2
+mb = MB()
+pts = [Vector((BOLT_BASE.x, BOLT_BASE.y, 70.0))]
+for i in range(1, 15):
+    t = i / 14.0
+    pts.append(Vector((BOLT_BASE.x + FXR.uniform(-1.8, 1.8) * (1 - t * 0.6), BOLT_BASE.y + FXR.uniform(-1.8, 1.8),
+                       lerp(70.0, BOLT_BASE.z, t))))
+pts[-1] = BOLT_BASE.copy()
+
+
+def beam_box(mb_, a, b, w, mat):
+    a, b = Vector(a), Vector(b)
+    z = (b - a).normalized()
+    x = z.orthogonal().normalized()
+    y = z.cross(x)
+    corners = []
+    for p in (a, b):
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            corners.append(p + x * sx * w / 2 + y * sy * w / 2)
+    idx = [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+    for q in idx:
+        mb_.quad([corners[i] for i in q], UV_FULL, mat)
+
+
+for a_, b_ in zip(pts, pts[1:]):
+    beam_box(mb, a_, b_, 0.34, MAT_WHITE)
+for br in range(3):
+    k0 = FXR.randint(3, 9)
+    p = pts[k0]
+    for j in range(FXR.randint(2, 4)):
+        q = p + Vector((FXR.uniform(-3, 3), FXR.uniform(-3, 3), -FXR.uniform(3, 7)))
+        beam_box(mb, p, q, 0.2, MAT_WHITE)
+        p = q
+bolt = mb.build("Lightning", C_FX)
+bolt.visible_shadow = False
+bolt["glow"] = 1.0
+key_vis(bolt, [(F_BOLT, F_BOLT + 2), (F_BOLT + 3, F_BOLT + 5), (F_BOLT + 6, F_BOLT + 7)])
+flash = bpy.data.lights.new("LightningFlash", "POINT")
+flash.color = (0.78, 0.84, 1.0)
+flash.shadow_soft_size = 3.0
+fl_obj = link(bpy.data.objects.new("LightningFlash", flash), C_LIGHTS)
+fl_obj.location = BOLT_BASE + Vector((0, 0, 14))
+FLASH_KEYS = [(F_BOLT - 1, 0), (F_BOLT, 1.0), (F_BOLT + 1, 0.55), (F_BOLT + 2, 0.08), (F_BOLT + 3, 0.85),
+              (F_BOLT + 4, 0.3), (F_BOLT + 5, 0.02), (F_BOLT + 6, 0.6), (F_BOLT + 7, 0.05), (F_BOLT + 9, 0)]
+interp("LINEAR")
+for f, v in FLASH_KEYS:
+    flash.energy = v * 5.0e4
     flash.keyframe_insert("energy", frame=f)
+cues.add(F_BOLT, "ambient/weather/thunder1", 1.0, channel=3)
+cues.add(F_BOLT, "item/trident/thunder2", 0.6, channel=4)
 
-# -------------------------------------------------------------- sky & light
+# --- телепорты
+burst(Vector((FH.x, FH.y, FH_Z)), 50, "ender", F_TP_OUT, tag="TpOutFar")
+burst(Vector((H1.x, H1.y, 0.0)), 70, "ender", F_TP_IN - 6, life=(6, 8), speed=(2.5, 4.5), implode=True,
+      tag="TpIn")
+burst(Vector((H1.x, H1.y, 0.0)), 30, "cyan", F_TP_IN, life=(10, 18), speed=(1.0, 2.5), tag="TpInGlow")
+cues.add(F_TP_OUT, "mob/endermen/portal", 0.4, channel=4)
+cues.add(F_TP_IN - 3, "mob/endermen/portal2", 1.0, channel=4)
 
-world = bpy.data.worlds.new("Sunset")
-scene.world = world
-wt = world.node_tree
-wt.nodes.clear()
-
-
-def sky_node(disc):
-    n = wt.nodes.new("ShaderNodeTexSky")
-    try:
-        n.sky_type = "MULTIPLE_SCATTERING"
-    except TypeError:
-        n.sky_type = "NISHITA"
-    n.sun_disc = disc
-    n.sun_size = rad(0.9)
-    n.sun_rotation = rad(SUN_ROT)
-    n.altitude = 200.0
-    if hasattr(n, "aerosol_density"):
-        n.aerosol_density = 2.2
-    elif hasattr(n, "dust_density"):
-        n.dust_density = 2.2
-    n.air_density = 1.15
-    n.ozone_density = 1.0
-    return n
-
-
-sky_cam, sky_light = sky_node(True), sky_node(False)
-SUN_EL = Track((F_START, 9.5, "lin"), (F_END, 3.0, "lin"))
+# --- столкновение кулака и меча (с замедлением)
+CLASH_P = hand_point(hero, "L", F_CLASH)
+print("[build] clash gap m", round((CLASH_P - CLASH_T).length, 3), "dist", round((H1 - S_STEP).length, 2), "H1", tuple(round(c, 2) for c in H1),
+      "punch", round(punch_fwd, 1))
+sparks(CLASH_P, 40, F_CLASH, -v3(D), spread=1.1, speed=(4, 9), life=(14, 26), tag="ClashSpark")
+ring("ClashRing", CLASH_P, v3(D), F_CLASH, 14, 3.2, kind="cyan", thick=0.05)
+ring("ClashRing2", Vector((CLASH_P.x, CLASH_P.y, 0.04)), (0, 0, 1), F_CLASH + 1, 18, 4.5, kind="cyan", thick=0.06)
+block_debris("ClashDebris", Vector((CLASH_P.x, CLASH_P.y, 0.0)) - v3(D) * 0.6, 10, F_CLASH, frozenset(),
+             vel=(1.0, 2.6), up=(2.5, 4.5), size=(0.16, 0.3), radius=1.2, types=("grass", "dirt", "dirt"))
+burst(Vector((CLASH_P.x, CLASH_P.y, CLASH_P.z - 0.9)), 18, "dust", F_CLASH + 1, life=(30, 50), speed=(0.6, 1.6),
+      size=(0.25, 0.5), height=0.4, tag="ClashDust")
+cl = bpy.data.lights.new("ClashFlash", "POINT")
+cl.color = (0.8, 0.92, 1.0)
+cl.shadow_soft_size = 0.2
+cl_obj = link(bpy.data.objects.new("ClashFlash", cl), C_LIGHTS)
+cl_obj.location = CLASH_P
 interp("LINEAR")
-for n in (sky_cam, sky_light):
-    for f in (F_START, F_END):
-        n.sun_elevation = rad(SUN_EL(f))
-        n.keyframe_insert("sun_elevation", frame=f)
-lp = wt.nodes.new("ShaderNodeLightPath")
-mixs = wt.nodes.new("ShaderNodeMix")
-mixs.data_type = "RGBA"
-wt.links.new(lp.outputs["Is Camera Ray"], mixs.inputs[0])
-wt.links.new(sky_light.outputs[0], mixs.inputs[6])
-wt.links.new(sky_cam.outputs[0], mixs.inputs[7])
-bg = wt.nodes.new("ShaderNodeBackground")
-bg.inputs["Strength"].default_value = 0.45
-wt.links.new(mixs.outputs[2], bg.inputs["Color"])
-wout = wt.nodes.new("ShaderNodeOutputWorld")
-wt.links.new(bg.outputs[0], wout.inputs["Surface"])
+for f, e in ((F_CLASH - 1, 0), (F_CLASH, 300), (F_CLASH + 2, 180), (F_CLASH + 8, 40), (F_CLASH + 16, 0)):
+    cl.energy = e
+    cl.keyframe_insert("energy", frame=f)
+flash_star = L.fx_object("ClashCore", ME_CUBE["white"], C_FX, glow=1.0)
+flash_star.location = CLASH_P
+L.key_attr(flash_star, "scale", [(F_CLASH, (0.16, 0.16, 0.16)), (F_CLASH + 3, (0.1, 0.1, 0.1)),
+                                 (F_CLASH + 8, (0.0, 0.0, 0.0))], kind="LINEAR")
+key_vis(flash_star, [(F_CLASH, F_CLASH + 9)])
+cues.add(F_CLASH, "random/anvil_land", 0.75, channel=3)
+cues.add(F_CLASH, "entity/player/attack/strong1", 1.0, channel=4)
+cues.add(F_CLASH, "random/explode1", 0.35, channel=5)
 
-# дымка и лучи: ограниченный объём (объём в World в Cycles «съедает» небо)
-fog_mat = new_material("Atmosphere")
-ft = NT(fog_mat)
-fv = ft.n("ShaderNodeVolumePrincipled")
-fv.inputs["Density"].default_value = 0.0016
-fv.inputs["Anisotropy"].default_value = 0.6
-fv.inputs["Color"].default_value = (1.0, 0.93, 0.85, 1.0)
-fo = ft.n("ShaderNodeOutputMaterial")
-ft.l(fv.outputs[0], fo.inputs["Volume"])
-fog = MB()
-for d in DIRS:
-    fog.quad(face_pts(d, (-300, -300, -8), (300, 300, 140)), UV_FULL, fog_mat)
-fog_obj = fog.build("Atmosphere", C_WORLD)
-fog_obj["note"] = "Плотность дымки: материал Atmosphere > Density (0 — выключить)"
-
-sun = bpy.data.lights.new("Sun", "SUN")
-sun.angle = rad(0.9)
-sun_obj = link(bpy.data.objects.new("Sun", sun), C_LIGHT)
-interp("LINEAR")
-for f, col, e in ((F_START, (1.0, 0.70, 0.45), 4.2), (F_END, (1.0, 0.50, 0.26), 2.6)):
-    el = rad(SUN_EL(f))
-    d = Vector((math.cos(el) * SUN_DIR2.x, math.cos(el) * SUN_DIR2.y, math.sin(el)))
-    sun_obj.rotation_euler = d.to_track_quat("Z", "Y").to_euler()
-    sun_obj.keyframe_insert("rotation_euler", frame=f)
-    sun.color = col
-    sun.energy = e
-    sun.keyframe_insert("color", frame=f)
-    sun.keyframe_insert("energy", frame=f)
-
-# ------------------------------------------------------------------ cameras
-
-
-def empty(name, loc=(0, 0, 0), collection=C_CAMS):
-    e = link(bpy.data.objects.new(name, None), collection)
-    e.empty_display_size = 0.2
-    e.location = loc
-    return e
-
-
-focus_steve = empty("Focus_Steve")
-c = focus_steve.constraints.new("COPY_LOCATION")
-c.target, c.subtarget, c.head_tail = steve_rig, "head", 0.4
-focus_creeper = empty("Focus_Creeper")
-c = focus_creeper.constraints.new("COPY_LOCATION")
-c.target, c.subtarget, c.head_tail = creeper_rig, "head", 0.4
-focus_rack = empty("Focus_Rack")
-c1 = focus_rack.constraints.new("COPY_LOCATION")
-c1.target, c1.subtarget, c1.head_tail = steve_rig, "head", 0.4
-c2 = focus_rack.constraints.new("COPY_LOCATION")
-c2.target, c2.subtarget, c2.head_tail = creeper_rig, "head", 0.4
+# --- заряд в ладони и луч
+PALM = hand_point(hero, "R", 480)
+ball = bpy.data.meshes.new("EnergyBall")
+import bmesh  # noqa: E402
+bm = bmesh.new()
+bmesh.ops.create_icosphere(bm, subdivisions=3, radius=1.0)
+bm.to_mesh(ball)
+bm.free()
+MAT_BALL = new_material("fx_energy_ball")
+_t = NT(MAT_BALL)
+lw = _t.n("ShaderNodeLayerWeight")
+lw.inputs["Blend"].default_value = 0.35
+core = _t.math("ADD", _t.math("MULTIPLY", _t.math("SUBTRACT", 1.0, lw.outputs["Facing"]), 14.0), 2.5)
+_t.out(_t.emission((0.5, 0.9, 1.0), _t.math("MULTIPLY", core, _t.attr("glow"))))
+ball.materials.append(MAT_BALL)
+ball_obj = L.fx_object("EnergyBall", ball, C_FX)
+L.bone_parent(ball_obj, hero.rig, "fore.R", Matrix.Translation(Vector((-6, -1.6, 10.6)) * hero.px))
 interp("BEZIER")
-for f, v in ((349, 0.0), (392, 0.0), (404, 1.0), (428, 1.0), (438, 0.0)):
-    c2.influence = v
-    c2.keyframe_insert("influence", frame=f)
+for f, s, g in ((F_CHARGE, 0.0, 0.0), (470, 0.07, 0.6), (494, 0.17, 1.0), (F_BEAM, 0.24, 1.4), (F_BEAM_END, 0.2, 1.2),
+                (F_BEAM_END + 6, 0.0, 0.0)):
+    ball_obj.scale = (s, s, s)
+    ball_obj.keyframe_insert("scale", frame=f)
+    ball_obj["glow"] = g
+    ball_obj.keyframe_insert('["glow"]', frame=f)
+key_vis(ball_obj, [(F_CHARGE, F_BEAM_END + 7)])
+palm_light = bpy.data.lights.new("PalmLight", "POINT")
+palm_light.color = (0.45, 0.85, 1.0)
+palm_light.shadow_soft_size = 0.05
+pl_obj = link(bpy.data.objects.new("PalmLight", palm_light), C_LIGHTS)
+L.bone_parent(pl_obj, hero.rig, "fore.R", Matrix.Translation(Vector((-6, -3.5, 10.6)) * hero.px))
+for f, e in ((F_CHARGE, 0), (494, 25), (F_BEAM, 120), (F_BEAM_END, 90), (F_BEAM_END + 6, 0)):
+    palm_light.energy = e
+    palm_light.keyframe_insert("energy", frame=f)
+for i in range(46):
+    f0 = FXR.randint(F_CHARGE, 488)
+    n = FXR.randint(10, 18)
+    dvec = Vector((FXR.gauss(0, 1), FXR.gauss(0, 1), FXR.gauss(0, 1))).normalized()
+    r0 = FXR.uniform(1.0, 2.2)
+    pts_ = []
+    for k in range(n):
+        t = k / (n - 1)
+        rr = r0 * (1 - t) ** 1.6
+        ax = dvec.cross(Vector((0, 0, 1))).normalized() if abs(dvec.z) < 0.95 else Vector((1, 0, 0))
+        swirl = Quaternion(Vector((0, 0, 1)), 2.0 * t)
+        pts_.append(PALM + swirl @ (dvec * rr) + ax * 0.0)
+    particle("cyan", "Charge_%02d" % i, f0, pts_, FXR.uniform(0.03, 0.06), shrink=False)
+cues.add(F_CHARGE, "block/respawn_anchor/charge1", 0.9, channel=4)
+cues.add(470, "block/beacon/power1", 0.7, channel=5)
+cues.add(484, "mob/warden/sonic_charge1", 1.0, channel=3)
 
-
-def make_camera(name, lens, fstop, focus, loc_keys, tgt_keys, focus_dist=None):
-    cam = bpy.data.cameras.new(name)
-    cam.lens = lens
-    cam.sensor_width = 36
-    cam.clip_start = 0.05
-    cam.clip_end = 3000
-    cam.dof.use_dof = True
-    cam.dof.aperture_fstop = fstop
-    cam.dof.aperture_blades = 7
-    if focus:
-        cam.dof.focus_object = focus
-    else:
-        cam.dof.focus_distance = focus_dist or 10
-    rig = empty("Rig_" + name)
-    tgt = empty("Target_" + name)
-    co = link(bpy.data.objects.new(name, cam), C_CAMS)
-    co.parent = rig
-    tc = rig.constraints.new("TRACK_TO")
-    tc.target = tgt
-    tc.track_axis = "TRACK_NEGATIVE_Z"
-    tc.up_axis = "UP_Y"
-    interp("BEZIER")
-    for f, p in loc_keys:
-        rig.location = p
-        rig.keyframe_insert("location", frame=f)
-    for f, p in tgt_keys:
-        tgt.location = p
-        tgt.keyframe_insert("location", frame=f)
-    cam_objs[name] = co
-    return co
-
-
-def steve_pt(f, dz=1.1, off=(0, 0, 0)):
-    P = steve_pose(f)
-    return (P["root.x"] + off[0], P["root.y"] + off[1], P["root.z"] + dz + off[2])
-
-
-make_camera("Cam_A_Establish", 24, 8.0, focus_steve,
-            [(1, (9.0, -6.5, 9.5)), (132, (5.4, -3.2, 3.4))],
-            [(1, (-10.0, 1.5, 1.8)), (132, (-4.4, 2.4, 1.2))])
-make_camera("Cam_B_Track", 35, 2.8, focus_steve,
-            [(f, steve_pt(f, 1.15, (-0.6 + 0.5 * seg(f, 133, 228), -4.6, 0))) for f in range(133, 206, 12)]
-            + [(228, (-1.1, -2.6, 1.3))],
-            [(f, steve_pt(f, 1.05)) for f in range(133, 206, 12)] + [(228, (0.25, 3.2, 1.55))])
-make_camera("Cam_C_Chop", 30, 2.8, focus_steve,
-            [(229, (3.9, 1.9, 1.3)), (348, (3.5, 2.1, 1.22))],
-            [(229, (0.45, 3.4, 1.2)), (348, (0.4, 3.4, 1.1))])
-make_camera("Cam_D_Rack", 50, 1.8, focus_rack,
-            [(349, (4.2, 6.0, 1.75)), (444, (4.0, 5.85, 1.7))],
-            [(349, (-0.15, 0.5, 1.3)), (444, (-0.1, 0.6, 1.25))])
-make_camera("Cam_E_Creeper", 28, 2.0, focus_creeper,
-            [(445, (-1.3, 3.2, 0.48)), (512, (-1.05, 2.95, 0.5))],
-            [(445, (0.0, 0.0, 0.95)), (476, (0.2, 1.6, 1.05)), (512, (0.2, 1.6, 1.1))])
-make_camera("Cam_F_React", 30, 2.8, focus_steve,
-            [(513, (-2.8, 1.0, 1.45)), (559, (-2.0, 0.6, 1.4))],
-            [(513, (0.2, 2.9, 1.35)), (530, (0.4, 3.0, 1.2))]
-            + [(f, steve_pt(f, 1.1)) for f in range(538, 560, 7)])
-camG = make_camera("Cam_G_Boom", 24, 8.0, None,
-                   [(560, (6.5, -9.5, 3.4)), (600, (6.9, -10.0, 3.5)), (648, (7.0, -10.2, 3.5))],
-                   [(560, (4.0, 2.0, 1.2)), (590, (6.8, 2.4, 1.0)), (648, (6.6, 2.3, 1.1))], focus_dist=11.5)
-make_camera("Cam_H_Final", 40, 2.4, focus_steve,
-            [(649, (15.0, 1.0, 1.6)), (720, (14.2, 1.1, 1.55))],
-            [(649, (9.0, 2.6, 0.9)), (668, (9.0, 2.6, 1.35)), (720, (9.0, 2.6, 1.45))])
-
-# тряска камеры при взрыве
+BEAM_W = 0.16
+mb = MB()
+mb.box(MAT_WHITE, (-0.5, 0.0, -0.5), (0.5, 1.0, 0.5))
+beam_core = mb.build("BeamCore", C_FX)
+mb = MB()
+MAT_GLOWSHELL = new_material("fx_beam_shell")
+_t = NT(MAT_GLOWSHELL)
+lw = _t.n("ShaderNodeLayerWeight")
+lw.inputs["Blend"].default_value = 0.5
+fac = _t.math("MULTIPLY", lw.outputs["Facing"], 0.0)
+fac = _t.math("POWER", _t.math("SUBTRACT", 1.0, lw.outputs["Facing"]), 1.5)
+_t.out(_t.mixs(_t.math("MULTIPLY", fac, _t.attr("fade")), _t.transparent(), _t.emission((0.35, 0.8, 1.0), 3.0)))
+mb.box(MAT_GLOWSHELL, (-0.5, 0.0, -0.5), (0.5, 1.0, 0.5))
+beam_shell = mb.build("BeamShell", C_FX)
+for ob in (beam_core, beam_shell):
+    ob.visible_shadow = False
+    ob["glow"] = 1.0
+    ob["fade"] = 1.0
+    ob.rotation_mode = "QUATERNION"
 interp("LINEAR")
-for f in range(F_BOOM - 1, F_BOOM + 34):
-    a = 0.0 if f < F_BOOM else math.exp(-(f - F_BOOM) / 8.0) * 2.2
-    camG.rotation_euler = (rad(a * R.uniform(-1, 1)), rad(a * R.uniform(-1, 1)), rad(a * 0.5 * R.uniform(-1, 1)))
-    camG.keyframe_insert("rotation_euler", frame=f)
+beam_light = bpy.data.lights.new("BeamLight", "POINT")
+beam_light.color = (0.5, 0.88, 1.0)
+beam_light.shadow_soft_size = 0.3
+bl_obj = link(bpy.data.objects.new("BeamLight", beam_light), C_LIGHTS)
+for f in range(F_BEAM - 1, F_BEAM_END + 6):
+    a_ = hand_point(hero, "R", f) + (v3(-D) * 0.08)
+    b_ = sword_point(f, 0.55)
+    dv = b_ - a_
+    grow = s5(seg(f, F_BEAM, F_BEAM + 2))
+    shrink = 1 - s5(seg(f, F_BEAM_END, F_BEAM_END + 5))
+    jit = 1 + 0.18 * math.sin(f * 2.3) + 0.12 * math.sin(f * 5.1)
+    q = dv.to_track_quat("Y", "Z")
+    for ob, w in ((beam_core, BEAM_W), (beam_shell, BEAM_W * 3.2)):
+        ob.location = a_
+        ob.rotation_quaternion = q
+        ob.scale = (w * jit * shrink, dv.length * grow, w * jit * shrink)
+        ob.keyframe_insert("location", frame=f)
+        ob.keyframe_insert("rotation_quaternion", frame=f)
+        ob.keyframe_insert("scale", frame=f)
+    bl_obj.location = b_ - dv.normalized() * 0.4
+    bl_obj.keyframe_insert("location", frame=f)
+    beam_light.energy = 0.0 if f < F_BEAM else 260 * shrink * jit
+    beam_light.keyframe_insert("energy", frame=f)
+    if F_BEAM <= f < F_BEAM_END:
+        perp = dv.normalized().cross(Vector((0, 0, 1))).normalized()
+        for s_ in (-1, 1):
+            sparks(b_ - dv.normalized() * 0.05, 2, f, -dv.normalized() * 0.3 + perp * s_, spread=0.5,
+                   speed=(3, 6), life=(6, 11), tag="BeamSpark_%d_%d" % (f, s_ + 1))
+        if f % 3 == 0:
+            foot = Vector((steve_pose(f)["x"], steve_pose(f)["y"], 0.05))
+            burst(foot, 2, "dust", f, life=(24, 40), speed=(0.3, 1.0), size=(0.18, 0.34), height=0.1,
+                  tag="SlideDust_%d" % f)
+            cues.add(f, "step/gravel%d" % FXR.randint(1, 4), 0.45, channel=6)
+for ob in (beam_core, beam_shell):
+    key_vis(ob, [(F_BEAM, F_BEAM_END + 6)])
+ring("BeamRing", PALM + v3(-D) * 0.3, v3(-D), F_BEAM, 10, 1.6, kind="cyan", thick=0.06)
+cues.add(F_BEAM, "mob/warden/sonic_boom1", 1.0, channel=3)
+cues.add(F_BEAM, "item/trident/thunder1", 0.5, channel=5)
 
-for name, f in SHOTS:
-    cam = next(c for n, c in cam_objs.items() if n.startswith("Cam_" + name))
-    mk = scene.timeline_markers.new(name, frame=f)
-    mk.camera = cam
-scene.camera = cam_objs["Cam_A_Establish"]
+# --- удар в землю
+cues.add(F_VANISH, "mob/endermen/portal", 0.7, channel=4)
+burst(Vector((H2.x, H2.y, 0.0)) + v3(D) * 0.18, 60, "ender", F_VANISH, life=(14, 24), speed=(1.5, 3.5),
+      tag="TpOutNear")
+block_debris("SlamDebris", SLAM_C, 30, F_SLAM, CRATER, vel=(3.0, 7.5), up=(5.0, 10.0), radius=2.4,
+             types=("grass", "dirt", "dirt", "stone", "cobblestone"))
+ring("SlamRing", SLAM_C + Vector((0, 0, 0.08)), (0, 0, 1), F_SLAM, 16, 9.0, kind="cyan", thick=0.05)
+ring("SlamRing2", SLAM_C + Vector((0, 0, 0.5)), (0, 0, 1), F_SLAM + 1, 11, 5.0, kind="cyan", thick=0.04)
+burst(SLAM_C + Vector((0, 0, -0.5)), 40, "dust", F_SLAM + 1, life=(50, 90), speed=(1.0, 3.2), size=(0.35, 0.8),
+      height=0.6, tag="SlamDust")
+sparks(SLAM_C + Vector((0, 0, 0.2)), 40, F_SLAM, (0, 0, 1), spread=1.3, speed=(5, 11), life=(14, 26), tag="SlamSpark")
+sl = bpy.data.lights.new("SlamFlash", "POINT")
+sl.color = (0.7, 0.9, 1.0)
+sl.shadow_soft_size = 0.6
+sl_obj = link(bpy.data.objects.new("SlamFlash", sl), C_LIGHTS)
+sl_obj.location = SLAM_C + Vector((0, 0, 1.2))
+interp("LINEAR")
+for f, e in ((F_SLAM - 1, 0), (F_SLAM, 12000), (F_SLAM + 3, 5000), (F_SLAM + 14, 600), (F_SLAM + 26, 0)):
+    sl.energy = e
+    sl.keyframe_insert("energy", frame=f)
+cues.add(F_SLAM, "random/explode2", 1.0, channel=3)
+cues.add(F_SLAM + 1, "random/explode4", 0.6, channel=5)
+cues.add(F_SLAM, "damage/fallbig", 0.9, channel=4)
+cues.add(F_SLAM, "mob/warden/sonic_boom2", 0.5, channel=6)
 
-# спрайты смотрят в камеру текущего плана
-for ob in SPRITES:
-    cons = []
-    for cname in ("Cam_G_Boom", "Cam_H_Final"):
-        tc = ob.constraints.new("TRACK_TO")
-        tc.target = cam_objs[cname]
-        tc.track_axis = "TRACK_Z"
-        tc.up_axis = "UP_Y"
-        cons.append(tc)
-    interp("CONSTANT")
-    for f, (a, b) in ((F_START, (1, 0)), (649, (0, 1))):
-        cons[0].influence, cons[1].influence = a, b
-        cons[0].keyframe_insert("influence", frame=f)
-        cons[1].keyframe_insert("influence", frame=f)
+# --- прочие звуки
+cues.add(F_DRAW, "item/armor/equip_diamond1", 0.9, channel=4)
+cues.add(F_DRAW + 4, "entity/player/attack/sweep1", 0.8, channel=5)
+cues.add(324, "step/grass%d" % FXR.randint(1, 6), 0.5, channel=6)
+cues.add(452, "step/grass%d" % FXR.randint(1, 6), 0.7, channel=6)
+cues.add(F_JUMP, "step/grass%d" % FXR.randint(1, 6), 0.8, channel=6)
+cues.add(F_EYES, "block/beacon/activate", 0.9, channel=4)
+cues.add(F_JUMP, "entity/player/attack/sweep1", 0.6, channel=5)
+cues.add(440, "entity/player/attack/knockback1", 0.5, channel=5)
+cues.add(1, "fire/fire", 0.25, channel=6, duration=7.5)
+cues.add(630, "ambient/cave/cave13", 0.7, channel=4)
+cues.add(F_EYES2 - 4, "mob/warden/heartbeat_1", 1.0, channel=5)
+cues.add(F_EYES2 + 18, "mob/warden/heartbeat_2", 1.0, channel=5)
+cues.add(1, "music/game/ancestry", 0.55, channel=1, duration=11.5,
+         volume_keys=[[1, 0.0], [30, 0.55], [230, 0.55], [276, 0.0]])
+# смещение подобрано анализом онсетов precipice.ogg: сильные доли совпадают с ударами 334/392/400/496/578
+cues.add(F_EYES + 10, "records/precipice", 0.7, channel=7, offset=98.77, duration=18.5,
+         volume_keys=[[F_EYES + 10, 0.0], [F_EYES + 40, 0.65], [690, 0.65], [F_CUT, 0.0]])
+
+# --- светлячки-частицы (как в референсе): лёгкие боке
+mote_mesh_b = MB()
+MAT_MOTE = new_material("fx_motes")
+_t = NT(MAT_MOTE)
+rnd = _t.n("ShaderNodeObjectInfo")
+geo = _t.n("ShaderNodeNewGeometry")
+rpi = _t.n("ShaderNodeAttribute", attribute_type="GEOMETRY", attribute_name="")
+isl = _t.n("ShaderNodeLightPath")
+r = _t.n("ShaderNodeNewGeometry")
+ri = _t.n("ShaderNodeObjectInfo")
+rand_island = None
+try:
+    rand_island = r.outputs["Random Per Island"]
+except KeyError:
+    rand_island = ri.outputs["Random"]
+tval = _t.value(0.0)
+dr = tval.outputs[0].driver_add("default_value")
+dr.driver.type = "SCRIPTED"
+dr.driver.expression = "frame"
+tw_ = _t.math("ADD", _t.math("MULTIPLY", 0.5, _t.math("SINE", _t.math("ADD", _t.math("MULTIPLY", tval.outputs[0], 0.21),
+                                                                       _t.math("MULTIPLY", rand_island, 40.0)))), 0.6)
+bright = _t.math("MULTIPLY", tw_, _t.math("ADD", 1.0, _t.math("MULTIPLY", _t.math("POWER", rand_island, 3.0), 5.0)))
+col = _t.ramp(rand_island, [(0.0, (0.35, 0.8, 1.0)), (0.82, (0.65, 0.9, 1.0)), (0.9, (1.0, 0.72, 0.4)),
+                            (1.0, (1.0, 0.8, 0.5))], mode="CONSTANT")
+_t.out(_t.emission(col, bright))
+for i in range(420):
+    a_ = FXR.uniform(0, 2 * math.pi)
+    rr = 22 * math.sqrt(FXR.random())
+    c = Vector((-4.0, 6.0)) + Vector((math.cos(a_), math.sin(a_))) * rr
+    gz = vox.top_z(c.x, c.y)
+    z = gz + FXR.uniform(0.4, 6.0) ** 1.0
+    s = FXR.uniform(0.012, 0.03)
+    mote_mesh_b.box(MAT_MOTE, (c.x - s, c.y - s, z - s), (c.x + s, c.y + s, z + s))
+motes = mote_mesh_b.build("Motes", C_FX)
+motes.visible_shadow = False
+motes.visible_diffuse = False
+mote_noise = bpy.data.textures.new("MoteDrift", "CLOUDS")
+mote_noise.noise_scale = 3.5
+mote_noise.cloud_type = "COLOR"
+md = motes.modifiers.new("Drift", "DISPLACE")
+md.texture = mote_noise
+md.texture_coords = "OBJECT"
+drift = L.make_empty("MoteDrift", C_FX)
+md.texture_coords_object = drift
+md.direction = "RGB_TO_XYZ"
+md.strength = 2.6
+md.mid_level = 0.5
+interp("LINEAR")
+for f, loc, mz in ((F0, (0, 0, 0), 0.0), (F1, (2.6, -1.8, 2.2), 0.9)):
+    drift.location = loc
+    drift.keyframe_insert("location", frame=f)
+    motes.location = (0, 0, mz)
+    motes.keyframe_insert("location", frame=f)
+
+# --------------------------------------------------------- sky & lighting
+
+print("[build] sky & lights...")
+world = bpy.data.worlds.new("NightSky")
+scene.world = world
+t = NT(world)
+dirv = t.vmath("NORMALIZE", t.n("ShaderNodeTexCoord").outputs["Generated"])
+hz = t.sep(dirv)[2]
+grad = t.ramp(t.math("MAP_RANGE", hz, 0, 0) if False else hz,
+              [(0.0, (0.055, 0.12, 0.24)), (0.06, (0.03, 0.075, 0.17)), (0.3, (0.012, 0.03, 0.085)),
+               (1.0, (0.004, 0.01, 0.035))])
+moon_v = t.comb(MOON_DIR.x, MOON_DIR.y, MOON_DIR.z)
+md_ = t.math("MAXIMUM", t.vmath("DOT_PRODUCT", dirv, moon_v), 0.0)
+halo = t.math("ADD", t.math("MULTIPLY", t.math("POWER", md_, 900.0), 1.2), t.math("MULTIPLY", t.math("POWER", md_, 24.0), 0.12))
+band_axis = Vector((0.42, 0.18, 0.89)).normalized()
+bd = t.vmath("DOT_PRODUCT", dirv, t.comb(*band_axis))
+band = t.math("EXPONENT", t.math("MULTIPLY", t.math("MULTIPLY", bd, bd), -14.0))
+nz1 = t.n("ShaderNodeTexNoise", noise_dimensions="3D")
+nz1.inputs["Scale"].default_value = 2.2
+nz1.inputs["Detail"].default_value = 9.0
+nz1.inputs["Roughness"].default_value = 0.62
+t.l(dirv, nz1.inputs["Vector"])
+neb = t.ramp(nz1.outputs["Fac"], [(0.38, (0, 0, 0)), (0.52, (0.03, 0.16, 0.22)), (0.64, (0.16, 0.07, 0.3)),
+                                   (0.78, (0.45, 0.4, 0.7))])
+nz2 = t.n("ShaderNodeTexNoise", noise_dimensions="3D")
+nz2.inputs["Scale"].default_value = 7.0
+nz2.inputs["Detail"].default_value = 6.0
+t.l(dirv, nz2.inputs["Vector"])
+dust = t.math("POWER", t.math("SUBTRACT", 1.0, nz2.outputs["Fac"]), 2.0)
+neb = t.vmul(neb, t.math("MULTIPLY", t.math("MULTIPLY", band, dust), 1.1))
+
+
+def stars(scale, size, gain, powr):
+    vo = t.n("ShaderNodeTexVoronoi", voronoi_dimensions="3D", feature="F1")
+    vo.inputs["Scale"].default_value = scale
+    t.l(dirv, vo.inputs["Vector"])
+    rnd_ = t.sep(vo.outputs["Color"])[0]
+    m_ = t.math("LESS_THAN", vo.outputs["Distance"], size)
+    return t.math("MULTIPLY", m_, t.math("MULTIPLY", t.math("POWER", rnd_, powr), gain))
+
+
+st_all = t.math("ADD", stars(260.0, 0.07, 30.0, 7.0), stars(700.0, 0.09, 6.0, 5.0))
+st_all = t.math("MULTIPLY", st_all, t.math("ADD", 1.0, t.math("MULTIPLY", band, 2.0)))
+above = t.math("SMOOTH_MIN", 1.0, t.math("MULTIPLY", t.math("MAXIMUM", hz, 0.0), 30.0), 0.1)
+sky = t.vmath("ADD", grad, neb)
+sky = t.vmath("ADD", sky, t.vmul(t.comb(0.6, 0.75, 1.0), halo))
+sky = t.vmath("ADD", sky, t.vmul(t.comb(0.85, 0.9, 1.0), t.math("MULTIPLY", st_all, above)))
+flash_v = t.value(0.0, "Flash")
+for f, v in FLASH_KEYS:
+    flash_v.outputs[0].default_value = v
+    flash_v.outputs[0].keyframe_insert("default_value", frame=f)
+sky_cam = t.vmul(sky, t.math("ADD", 1.0, t.math("MULTIPLY", flash_v.outputs[0], 1.5)))
+amb = t.vmul(t.comb(0.02, 0.04, 0.09), t.math("ADD", 1.0, t.math("MULTIPLY", flash_v.outputs[0], 5.0)))
+lp = t.n("ShaderNodeLightPath")
+camish = t.math("MAXIMUM", lp.outputs["Is Camera Ray"], lp.outputs["Is Glossy Ray"])
+bg = t.n("ShaderNodeBackground")
+t.l(t.mixc(camish, amb, sky_cam), bg.inputs["Color"])
+bg.inputs["Strength"].default_value = 1.0
+wo = t.n("ShaderNodeOutputWorld")
+t.l(bg.outputs[0], wo.inputs["Surface"])
+
+# луна: ванильная квадратная текстура
+MAT_MOON = new_material("mc_moon")
+_t = NT(MAT_MOON)
+im = _t.img(tex("environment/celestial/moon/full_moon"), ext="EXTEND")
+_t.out(_t.adds(_t.transparent(), _t.emission(im.outputs["Color"], 7.0)))
+mb = MB()
+mb.quad([(-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5)], UV_FULL, MAT_MOON)
+moon = mb.build("Moon", C_WORLD)
+moon.location = MOON_DIR * 900.0
+moon.scale = (130, 130, 130)
+moon.rotation_euler = (-MOON_DIR).to_track_quat("-Y", "Z").to_euler()
+for attr in ("visible_diffuse", "visible_shadow", "visible_transmission", "visible_volume_scatter"):
+    setattr(moon, attr, False)
+
+sun = bpy.data.lights.new("Moonlight", "SUN")
+sun.angle = rad(0.6)
+sun.color = (0.58, 0.72, 1.0)
+sun.energy = 2.0
+sun_obj = link(bpy.data.objects.new("Moonlight", sun), C_LIGHTS)
+sun_obj.rotation_euler = MOON_DIR.to_track_quat("Z", "Y").to_euler()
+
+tl = bpy.data.lights.new("TorchLight", "POINT")
+tl.color = (1.0, 0.58, 0.26)
+tl.energy = 70.0
+tl.shadow_soft_size = 0.06
+tl_obj = link(bpy.data.objects.new("TorchLight", tl), C_LIGHTS)
+tl_obj.location = TORCH_FLAME
+tl.keyframe_insert("energy", frame=F0)
+for fc in L.fcurves_of(tl):
+    if fc.data_path == "energy":
+        m_ = fc.modifiers.new("NOISE")
+        m_.scale = 3.0
+        m_.strength = 14.0
+
+# дымка в долине: объём с плотностью по высоте (лучи луны, ореолы у света)
+fog_mat = new_material("Atmosphere")
+_t = NT(fog_mat)
+pos = _t.sep(_t.n("ShaderNodeNewGeometry").outputs["Position"])
+dens = _t.math("ADD", 0.004, _t.math("MULTIPLY", 0.05, _t.math("EXPONENT", _t.math("DIVIDE",
+                                                                             _t.math("SUBTRACT", -8.5, pos[2]), 3.2))))
+dens = _t.math("MINIMUM", dens, 0.06)
+pv = _t.n("ShaderNodeVolumePrincipled")
+_t.l(dens, pv.inputs["Density"])
+pv.inputs["Color"].default_value = (0.7, 0.82, 1.0, 1.0)
+pv.inputs["Anisotropy"].default_value = 0.45
+_t.out(volume=pv.outputs[0])
+mb = MB()
+mb.box(fog_mat, (-110, -110, -14), (110, 110, 45))
+fog = mb.build("Atmosphere", C_WORLD)
+fog["note"] = "Дымка: материал Atmosphere (плотность в узлах). Скрыть объект — рендер быстрее"
+
+# ----------------------------------------------------------------- cameras
+
+print("[build] cameras...")
+
+
+def P3(p2, z):
+    return (p2.x, p2.y, z)
+
+
+f_steve = L.track_bone("Focus_Steve", C_CAMS, steve.rig, "head", 0.45)
+f_hero = L.track_bone("Focus_Herobrine", C_CAMS, hero.rig, "head", 0.45)
+f_sword = L.make_empty("Focus_Sword", C_CAMS)
+c_ = f_sword.constraints.new("COPY_LOCATION")
+c_.target = sword
+SHOTS = []
+
+
+def shot(name, f0, f1, cam):
+    SHOTS.append(L.Shot(name, f0, f1, cam))
+    return cam
+
+
+HB_TOP = Vector((FH.x, FH.y, FH_Z))
+# A: общий план со спины — луна, долина, дальний холм
+shot("A", 1, 110, L.make_camera(
+    "Cam_A_Establish", C_CAMS, 26, 4.0, f_steve,
+    [(1, P3(S0 - D * 4.6 + RV * 2.3, 0.9)), (110, P3(S0 - D * 3.7 + RV * 1.8, 1.0))],
+    [(1, P3(S0 + D * 14, 2.9)), (110, P3(S0 + D * 14, 2.7))]))
+# B: крупный план Стива — глаза бегают
+shot("B", 111, 186, L.make_camera(
+    "Cam_B_Close", C_CAMS, 50, 2.0, f_steve,
+    [(111, P3(S0 + D * 3.3 - RV * 1.2, 1.62)), (186, P3(S0 + D * 2.9 - RV * 1.0, 1.6))],
+    [(111, P3(S0, 1.42)), (186, P3(S0, 1.45))]))
+# C: через плечо — молния и силуэт на холме
+shot("C", 187, 240, L.make_camera(
+    "Cam_C_OTS", C_CAMS, 75, 5.6, 34.0,
+    [(187, P3(S0 - D * 4.3 + RV * 0.95, 1.86)), (240, P3(S0 - D * 4.0 + RV * 0.88, 1.84))],
+    [(187, P3(FH, FH_Z + 1.5)), (240, P3(FH, FH_Z + 1.3))]))
+# D: макро — глаза Herobrine загораются
+shot("D", 241, 310, L.make_camera(
+    "Cam_D_Eyes", C_CAMS, 85, 1.8, f_hero,
+    [(241, P3(FH - D * 5.2, FH_Z + 1.05)), (310, P3(FH - D * 3.1, FH_Z + 1.2))],
+    [(241, P3(FH, FH_Z + 1.55)), (310, P3(FH, FH_Z + 1.6))]))
+# E: Стив выхватывает меч (низкий ракурс)
+shot("E", 311, 380, L.make_camera(
+    "Cam_E_Draw", C_CAMS, 28, 2.8, f_steve,
+    [(311, P3(S0 + D * 3.9 + RV * 1.7, 0.42)), (380, P3(S0 + D * 3.5 + RV * 1.45, 0.45))],
+    [(311, P3(S0, 1.0)), (380, P3(S0, 1.05))]))
+# F: телепорт и удар — профиль
+MID1 = (S0 + H1) * 0.5
+shot("F", 381, 399, L.make_camera(
+    "Cam_F_Clash", C_CAMS, 30, 4.0, 4.8,
+    [(381, P3(MID1 + RV * 4.6, 1.15)), (399, P3(MID1 + RV * 4.3, 1.1))],
+    [(381, P3(MID1, 1.05)), (399, P3(MID1, 1.05))]))
+# G: замедление — облёт вокруг столкновения
+orb = []
+for k, f in enumerate(range(400, 451, 10)):
+    ang = lerp(-25, 35, k / 5.0)
+    p = MID1 + rot2(RV, ang) * 3.7
+    orb.append((f, P3(p, 1.45 - 0.1 * k / 5.0)))
+shot("G", 400, 450, L.make_camera("Cam_G_Slowmo", C_CAMS, 35, 2.4, 3.7, orb,
+                                  [(400, P3(MID1, 1.25)), (450, P3(MID1, 1.15))]))
+# H: заряд — из-за плеча Herobrine
+shot("H", 451, 495, L.make_camera(
+    "Cam_H_Charge", C_CAMS, 38, 2.8, f_steve,
+    [(451, P3(H2 + D * 2.7 - RV * 1.35, 2.05)), (495, P3(H2 + D * 2.4 - RV * 1.2, 1.95))],
+    [(451, P3(S0, 1.0)), (495, P3(S0, 1.0))]))
+# I: луч и скольжение — широкий профиль
+MID2 = (S1 + H2) * 0.5
+shot("I", 496, 540, L.make_camera(
+    "Cam_I_Beam", C_CAMS, 24, 4.0, 7.2,
+    [(496, P3(MID2 + RV * 7.0, 1.5)), (540, P3(MID2 + RV * 6.6, 1.45))],
+    [(496, P3(MID2, 1.0)), (540, P3(MID2, 1.0))]))
+# J: прыжок на фоне луны (теле)
+APEX = JUMP_FROM.lerp(JUMP_TO, 0.5)
+_pa = steve_pose(563)
+APEX_C = Vector((_pa["x"], _pa["y"], _pa["z"] + 0.95))
+cam_j = APEX_C - MOON_DIR * 16.0
+shot("J", 541, 575, L.make_camera(
+    "Cam_J_Moon", C_CAMS, 60, 4.0, f_steve,
+    [(541, tuple(cam_j)), (575, tuple(cam_j + Vector((0, 0, -0.15))))],
+    [(541, tuple(APEX_C - Vector((0, 0, 0.6)))), (575, tuple(APEX_C - Vector((0, 0, 0.3))))]))
+# K: удар — общий план сверху, сильная тряска
+shot("K", 576, 620, L.make_camera(
+    "Cam_K_Slam", C_CAMS, 22, 5.6, 8.0,
+    [(576, P3(SLAM_C.xy + RV * 6.0 - D * 4.0, 3.2)), (620, P3(SLAM_C.xy + RV * 6.6 - D * 4.6, 3.4))],
+    [(576, P3(SLAM_C.xy, 0.4)), (620, P3(SLAM_C.xy, 0.2))]))
+# L: после — Стив в воронке
+shot("L", 621, 684, L.make_camera(
+    "Cam_L_After", C_CAMS, 40, 2.8, f_steve,
+    [(621, P3(JUMP_TO + D * 4.8 + RV * 1.2, 0.6)), (684, P3(JUMP_TO + D * 4.3 + RV * 1.0, 0.55))],
+    [(621, P3(JUMP_TO, 1.0)), (684, P3(JUMP_TO, 1.05))]))
+# M: финал — лицо Стива, позади зажигаются глаза
+shot("M", 685, 720, L.make_camera(
+    "Cam_M_Final", C_CAMS, 75, 2.8, f_steve,
+    [(685, P3(CAM_M, 1.56)), (720, P3(JUMP_TO + D * 2.8 + RV * 0.3, 1.55))],
+    [(685, P3(JUMP_TO, 1.5)), (720, P3(JUMP_TO, 1.5))]))
+
+for sh in SHOTS:
+    mk = scene.timeline_markers.new(sh.name, frame=sh.f0)
+    mk.camera = sh.cam
+    L.add_handheld(sh.cam, strength=0.0018 if sh.name not in ("D", "J") else 0.0009)
+scene.camera = SHOTS[0].cam
+SR = random.Random(5)
+L.add_shake(bpy.data.objects["Cam_C_OTS"], F_BOLT, 14, 0.5, SR)
+L.add_shake(bpy.data.objects["Cam_G_Slowmo"], 400, 36, 1.2, SR, decay=6.0)
+L.add_shake(bpy.data.objects["Cam_I_Beam"], F_BEAM, 26, 0.6, SR, decay=16.0)
+L.add_shake(bpy.data.objects["Cam_K_Slam"], F_SLAM, 34, 2.4, SR, decay=8.0)
+
+# подсветка персонажей по планам (light linking: только Стив и Herobrine)
+COOL, WARM, RIM = (0.6, 0.75, 1.0), (1.0, 0.7, 0.45), (0.55, 0.8, 1.0)
+
+
+def rig_lights(sh, subj, fill_col, fill_mul=1.0, rim_mul=1.0, rim_col=RIM):
+    cam_loc = Vector(sh.cam.parent.location) if sh.cam.parent else sh.cam.location
+    subj = Vector(subj)
+    to_cam = (cam_loc - subj)
+    dist = max(1.0, to_cam.length)
+    side = to_cam.normalized().cross(Vector((0, 0, 1))).normalized()
+    fill_loc = cam_loc + side * 0.8 * dist * 0.4 + Vector((0, 0, 0.6))
+    rim_loc = subj - to_cam.normalized() * 2.6 - side * 1.4 + Vector((0, 0, 1.6))
+    fr = [(sh.f0, sh.f1 + 1)]
+    L.char_light("Fill_" + sh.name, C_LIGHTS, C_CHARS, "AREA", fill_col, 2.2 * dist * dist * fill_mul, fill_loc,
+                 subj, size=1.6, frames=fr)
+    L.char_light("Rim_" + sh.name, C_LIGHTS, C_CHARS, "AREA", rim_col, 70.0 * rim_mul, rim_loc, subj, size=0.8,
+                 frames=fr)
+
+
+SUBJ = {"A": P3(S0, 1.0), "B": P3(S0, 1.5), "C": P3(S0, 1.4), "D": P3(FH, FH_Z + 1.6), "E": P3(S0, 1.1),
+        "F": P3(MID1, 1.1), "G": P3(MID1, 1.2), "H": P3(S0, 1.1), "I": P3(MID2, 1.0), "J": tuple(APEX_C),
+        "K": P3(SLAM_C.xy, 0.3), "L": P3(JUMP_TO, 1.0), "M": P3(JUMP_TO, 1.5)}
+FILLS = {"A": (COOL, 0.9, 1.2), "B": (WARM, 0.35, 1.0), "C": (COOL, 0.5, 1.2), "D": (COOL, 0.08, 1.6),
+         "E": (COOL, 1.1, 1.5), "F": (COOL, 0.6, 1.0), "G": (COOL, 0.5, 1.2), "H": (COOL, 0.5, 1.0),
+         "I": (COOL, 0.5, 1.0), "J": (COOL, 0.25, 1.4), "K": (COOL, 0.5, 1.0), "L": (WARM, 0.7, 1.2),
+         "M": (WARM, 0.9, 1.0)}
+for sh in SHOTS:
+    col, fm, rm = FILLS[sh.name]
+    rig_lights(sh, SUBJ[sh.name], col, fm, rm)
+
+print("[build] trees & plants...")
+
+
+def fc_loc(obj, f):
+    v = Vector(obj.location)
+    for fc in L.fcurves_of(obj):
+        if fc.data_path == "location":
+            v[fc.array_index] = fc.evaluate(f)
+    return v
+
+
+CAM_PATH = []
+for sh in SHOTS:
+    for f in range(sh.f0, sh.f1 + 1, 4):
+        CAM_PATH.append((sh.name, fc_loc(sh.cam.parent, f), fc_loc(bpy.data.objects["Target_" + sh.cam.name], f)))
+SIGHT = [(S0, FH)] + [(c.xy, t.xy) for _, c, t in CAM_PATH]
+_, cj, tj = next(x for x in CAM_PATH if x[0] == "J")
+SIGHT.append((tj.xy, (tj + (tj - cj).normalized() * 30.0).xy))  # чистый фон за прыжком на фоне луны
+_mr = Vector((MOON2.y, -MOON2.x))
+for o_ in (-7.5, -2.5, 2.5, 7.5):  # коридор к луне: кроны не перекрывают лунный свет на скале и саму луну
+    SIGHT.append((S0 + _mr * o_, S0 + _mr * o_ + MOON2 * 90.0))
+
+
+def cells_near(segs, r):
+    out = set()
+    for a, b in segs:
+        for x in range(int(math.floor(min(a.x, b.x) - r)), int(math.ceil(max(a.x, b.x) + r)) + 1):
+            for y in range(int(math.floor(min(a.y, b.y) - r)), int(math.ceil(max(a.y, b.y) + r)) + 1):
+                if (x, y) not in out and seg_dist(Vector((x + 0.5, y + 0.5)), a, b) < r:
+                    out.add((x, y))
+    return out
+
+
+NO_TREE = cells_near(SIGHT, 4.2)
+NO_PLANT = cells_near([(c.xy, c.xy + Vector((0.001, 0.0))) for _, c, _ in CAM_PATH], 1.7)
+
+# светлячки у самой камеры превращаются в огромные пятна — убираем их с пути камер
+_bm = bmesh.new()
+_bm.from_mesh(motes.data)
+_cams = [c for _, c, _ in CAM_PATH]
+_vs = list(_bm.verts)
+_kill = []
+for i in range(0, len(_vs), 24):  # 24 вершины на кубик
+    chunk = _vs[i:i + 24]
+    cen = sum((v.co for v in chunk), Vector()) / len(chunk)
+    if any((cen - c).length < 4.0 for c in _cams):
+        _kill.extend(chunk)
+bmesh.ops.delete(_bm, geom=_kill, context="VERTS")
+_bm.to_mesh(motes.data)
+_bm.free()
+TREES = []
+attempts = 0
+while len(TREES) < 150 and attempts < 9000:
+    attempts += 1
+    x, y = R.randint(-WH + 3, WH - 4), R.randint(-WH + 3, WH - 4)
+    p = Vector((x + 0.5, y + 0.5))
+    h = vox.hmap[(x, y)]
+    if h <= WATER_Z or vox.blocks.get((x, y, h)) != "grass":
+        continue
+    if p.length < 10.5 or (p - FH).length < 5.5:
+        continue
+    if (x, y) in NO_TREE:
+        continue
+    if any(math.hypot(x - t[0], y - t[1]) < 3.6 for t in TREES):
+        continue
+    kind = "spruce" if R.random() < 0.7 else "oak"
+    L.place_tree(vox, x, y, kind, R.randint(6, 9) if kind == "spruce" else R.randint(4, 6), R)
+    TREES.append((x, y))
+
+for (x, y), h in vox.hmap.items():
+    if vox.blocks.get((x, y, h)) != "grass" or (x, y, h + 1) in vox.blocks:
+        continue
+    if (x, y) == TORCH or (x, y) in NO_PLANT:
+        continue
+    r = R.random()
+    if r < 0.24:
+        vox.plants.append((x, y, h + 1, "short_grass"))
+    elif r < 0.29:
+        vox.plants.append((x, y, h + 1, "fern"))
+    elif r < 0.32:
+        vox.plants.append((x, y, h + 1, R.choice(("tall_grass", "large_fern"))))
+    elif r < 0.345:
+        vox.plants.append((x, y, h + 1, R.choice(("cornflower", "azure_bluet", "oxeye_daisy", "poppy"))))
+
+
+print("[build] meshes...")
+parts = vox.emit(region=not_local)
+terrain = parts["solid"].build("Terrain", C_WORLD)
+leaves = parts["leaves"].build("Leaves", C_WORLD)
+water = parts["water"].build("Water", C_WORLD)
+plants = vox.emit_plants(PLANT_MATS, region=not_local).build("Plants", C_WORLD)
+for tag, removed in (("A", frozenset()), ("B", CRATER)):
+    lp = vox.emit(removed=removed, region=in_local)
+    ob = lp["solid"].build("Local_" + tag, C_WORLD)
+    pl = vox.emit_plants(PLANT_MATS, removed=removed, region=in_local).build("LocalPlants_" + tag, C_WORLD)
+    rng_ = [(F0, F_SLAM)] if tag == "A" else [(F_SLAM, F1 + 10)]
+    key_vis(ob, rng_)
+    key_vis(pl, rng_)
+
+# ветер: трава и листья колышутся
+wind = L.make_empty("Wind", C_WORLD)
+interp("LINEAR")
+for f, loc in ((F0, (0, 0, 0)), (F1, (9.0, 4.0, 0.0))):
+    wind.location = loc
+    wind.keyframe_insert("location", frame=f)
+for obj, strength in ((plants, 0.09), (bpy.data.objects["LocalPlants_A"], 0.09), (bpy.data.objects["LocalPlants_B"], 0.09)):
+    tw = bpy.data.textures.new("WindNoise", "CLOUDS")
+    tw.noise_scale = 1.6
+    tw.cloud_type = "COLOR"
+    md = obj.modifiers.new("Wind", "DISPLACE")
+    md.texture = tw
+    md.texture_coords = "OBJECT"
+    md.texture_coords_object = wind
+    md.direction = "RGB_TO_XYZ"
+    md.strength = strength
+    md.mid_level = 0.5
+    md.vertex_group = "sway"
 
 # ------------------------------------------------------------------ render
 
-scene.frame_start, scene.frame_end = F_START, F_END
-scene.render.fps = FPS
-scene.render.resolution_x, scene.render.resolution_y = 1920, 1080
+scene.render.resolution_x, scene.render.resolution_y = 1920, 804
 scene.render.resolution_percentage = 100
 scene.render.engine = "CYCLES"
 cy = scene.cycles
 cy.device = "GPU"
-cy.samples = 384
+cy.samples = 256
 cy.use_adaptive_sampling = True
-cy.adaptive_threshold = 0.01
+cy.adaptive_threshold = 0.012
 cy.use_denoising = True
 try:
     cy.denoiser = "OPENIMAGEDENOISE"
 except TypeError:
     pass
 cy.max_bounces = 8
-cy.diffuse_bounces = 4
-cy.glossy_bounces = 4
-cy.transmission_bounces = 8
+cy.diffuse_bounces = 3
+cy.glossy_bounces = 3
+cy.transmission_bounces = 6
 cy.transparent_max_bounces = 32
-cy.volume_bounces = 1
-cy.sample_clamp_indirect = 8.0
+cy.volume_bounces = 0
+cy.volume_step_rate = 2.0
+cy.sample_clamp_indirect = 6.0
 cy.caustics_reflective = False
 cy.caustics_refractive = False
 cy.use_light_tree = True
 scene.render.use_motion_blur = True
 scene.render.motion_blur_shutter = 0.5
 scene.render.use_persistent_data = True
-scene.render.film_transparent = False
 vs = scene.view_settings
 vs.view_transform = "AgX"
-for look_name in ("AgX - Medium High Contrast", "AgX - Punchy"):
-    try:
-        vs.look = look_name
-        break
-    except TypeError:
-        continue
-interp("BEZIER")
-for f, e in ((F_START, -6.0), (14, 0.0), (710, 0.0), (F_END, -8.0)):
+vs.look = "AgX - Medium High Contrast"
+interp("CONSTANT")
+for f, e in ((F0, 1.15), (F_CUT, -12.0)):
     vs.exposure = e
     vs.keyframe_insert("exposure", frame=f)
+for fc in L.fcurves_of(scene):
+    if fc.data_path == "view_settings.exposure":
+        for kp in fc.keyframe_points:
+            kp.interpolation = "CONSTANT"
 
-ee = scene.eevee
-for attr, val in (("taa_render_samples", 64), ("use_raytracing", True), ("use_shadows", True),
-                  ("volumetric_end", 250.0), ("volumetric_tile_size", "4")):
-    if hasattr(ee, attr):
-        try:
-            setattr(ee, attr, val)
-        except (TypeError, AttributeError):
-            pass
-
-im = scene.render.image_settings
+# компоузинг: блум, цвет, хроматическая аберрация, виньетка
+ng = bpy.data.node_groups.new("Grade", "CompositorNodeTree")
+ng.interface.new_socket(name="Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+scene.compositing_node_group = ng
+rl = ng.nodes.new("CompositorNodeRLayers")
+gl = ng.nodes.new("CompositorNodeGlare")
+print("[build] glare defaults", [(i.name, getattr(i, "default_value", None)) for i in gl.inputs if i.name != "Image"])
+for k, v in (("Type", "Bloom"), ("Quality", "High"), ("Threshold", 1.0), ("Strength", 0.32), ("Size", 0.55)):
+    try:
+        gl.inputs[k].default_value = v
+    except (TypeError, KeyError, ValueError) as ex:
+        print("[build] glare", k, ex)
+ng.links.new(rl.outputs["Image"], gl.inputs["Image"])
+cb = ng.nodes.new("CompositorNodeColorBalance")
+ng.links.new(gl.outputs["Image"], cb.inputs["Image"])
 try:
-    im.media_type = "VIDEO"
-except (AttributeError, TypeError):
-    pass
-im.file_format = "FFMPEG"
+    cb.inputs[4].default_value = (0.97, 0.99, 1.05, 1.0)
+    cb.inputs[8].default_value = (1.05, 1.0, 0.95, 1.0)
+except (IndexError, TypeError) as ex:
+    print("[build] color balance", ex)
+ld = ng.nodes.new("CompositorNodeLensdist")
+ld.inputs["Dispersion"].default_value = 0.012
+ng.links.new(cb.outputs["Image"], ld.inputs["Image"])
+em = ng.nodes.new("CompositorNodeEllipseMask")
+em.inputs["Size"].default_value = (0.95, 0.9)
+bl = ng.nodes.new("CompositorNodeBlur")
+bl.inputs["Size"].default_value = (220, 220)
+ng.links.new(em.outputs["Mask"], bl.inputs["Image"])
+mix = ng.nodes.new("ShaderNodeMix")
+mix.data_type = "RGBA"
+mix.blend_type = "MULTIPLY"
+mix.inputs[0].default_value = 0.45
+ng.links.new(ld.outputs["Image"], mix.inputs[6])
+ng.links.new(bl.outputs["Image"], mix.inputs[7])
+go = ng.nodes.new("NodeGroupOutput")
+ng.links.new(mix.outputs[2], go.inputs[0])
+scene.render.use_compositing = True
+
+im_s = scene.render.image_settings
+im_s.media_type = "VIDEO"
+im_s.file_format = "FFMPEG"
 ff = scene.render.ffmpeg
 ff.format = "MPEG4"
 ff.codec = "H264"
@@ -1833,13 +1618,47 @@ ff.ffmpeg_preset = "GOOD"
 ff.audio_codec = "AAC"
 ff.audio_bitrate = 192
 ff.audio_channels = "STEREO"
-scene.render.filepath = "//render/minecraft_sunset_"
+scene.render.filepath = "//render/herobrine_"
 scene.sync_mode = "AUDIO_SYNC"
+
+# ------------------------------------------------------------- checks
+
+
+def lowest(obj):
+    dg = bpy.context.evaluated_depsgraph_get()
+    e = obj.evaluated_get(dg)
+    me = e.to_mesh()
+    z = min((e.matrix_world @ v.co).z for v in me.vertices)
+    e.to_mesh_clear()
+    return z
+
+
+def proj(cam, p):
+    v = world_to_camera_view(scene, cam, Vector(p))
+    return (round(v.x, 2), round(v.y, 2), round(v.z, 1))
+
+
+for f in (60, 330, 420, 452, 500, 548, 578, 600, 700):
+    scene.frame_set(f)
+    for ch in (steve, hero):
+        if ch.mesh.hide_render:
+            continue
+        r_ = bone_world(ch, "root", False)
+        g_ = vox.top_z(r_.x, r_.y, CRATER if f >= F_SLAM else frozenset())
+        print("[check] feet", ch.name, f, "gap", round(lowest(ch.mesh) - g_, 3))
+for sh in SHOTS:
+    fm = (sh.f0 + sh.f1) // 2
+    scene.frame_set(fm)
+    print("[check] frame", sh.name, fm, "steve", proj(sh.cam, bone_world(steve, "head", True)),
+          "hero", proj(sh.cam, bone_world(hero, "head", True)))
+scene.frame_set(562)
+print("[check] J moon", proj(bpy.data.objects["Cam_J_Moon"], moon.location))
+scene.frame_set(700)
+print("[check] M eyes", proj(bpy.data.objects["Cam_M_Final"], bone_world(hero, "head", False) + Vector((0, 0, 0.2))))
 
 # ------------------------------------------------------------- embed & save
 
-cue_text = bpy.data.texts.new("mc_cues.json")
-cue_text.from_string(json.dumps({"fps": FPS, "cues": sorted(cues, key=lambda c: c["frame"])}, indent=1))
+cues.to_text(FPS)
 loader = bpy.data.texts.new("mc_assets.py")
 with open(os.path.join(HERE, "mc_assets.py"), "r", encoding="utf-8") as fh:
     loader.from_string(fh.read())
@@ -1847,8 +1666,7 @@ loader.use_module = True
 notes = bpy.data.texts.new("README")
 with open(os.path.join(ROOT, "README.md"), "r", encoding="utf-8") as fh:
     notes.from_string(fh.read())
-
-scene.frame_set(F_START)
+scene.frame_set(F0)
 interp("BEZIER")
 bpy.ops.wm.save_as_mainfile(filepath=OUT, compress=True, relative_remap=True)
-print("[build] saved", OUT, "| trees:", len(TREES), "| crater blocks:", len(CRATER), "| cues:", len(cues))
+print("[build] saved", OUT, "| trees:", len(TREES), "| crater:", len(CRATER), "| cues:", len(cues.items))
