@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="referrer" content="no-referrer">
+    <title>License Gate — доступ по ключу</title>
+    <link rel="icon" href="/mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="License Gate, главная">
+          <span class="brand-mark" aria-hidden="true">L</span>
+          <span>license<span class="brand-light">gate</span></span>
+        </a>
+        <span id="connection" class="connection" data-state="pending" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connection-label">подключение к api</span>
+        </span>
+      </header>
+
+      <main>
+        <div class="page-heading">
+          <p class="eyebrow">DEVICE-BOUND LICENSING</p>
+          <h1>ваш ключ.<br>ваше устройство.</h1>
+          <p class="intro">активируйте лицензию и получите защищённую серверную сессию.</p>
+        </div>
+
+        <div class="access-card">
+          <aside class="overview" aria-label="Как работает активация">
+            <div>
+              <span class="outline-label">КОНТРОЛЬ ДОСТУПА</span>
+              <h2>одна лицензия.<br>одна привязка.</h2>
+              <p class="overview-copy">ключ связывается с отпечатком устройства при первой успешной активации.</p>
+            </div>
+            <ol class="steps">
+              <li><span class="step-number">01</span><div><strong>проверка ключа</strong><span>срок действия и статус лицензии</span></div></li>
+              <li><span class="step-number">02</span><div><strong>привязка устройства</strong><span>совпадение переданного HWID</span></div></li>
+              <li><span class="step-number">03</span><div><strong>серверная сессия</strong><span>HttpOnly cookie · до 15 минут</span></div></li>
+            </ol>
+            <div class="privacy-note"><span class="small-mark" aria-hidden="true">↳</span><p>ключ не сохраняется в браузере.<br>отпечаток хранится на сервере как HMAC.</p></div>
+          </aside>
+
+          <section class="access-panel" aria-labelledby="panel-title">
+            <div class="panel-heading">
+              <span class="panel-index" aria-hidden="true">/ 01</span>
+              <h2 id="panel-title">вход по лицензии</h2>
+              <p id="panel-description">введите ключ и стабильный отпечаток устройства.</p>
+            </div>
+
+            <p id="feedback" class="feedback" role="alert" aria-live="assertive" hidden></p>
+
+            <form id="license-form">
+              <div class="field">
+                <label for="license-key">лицензионный ключ</label>
+                <input id="license-key" name="key" type="password" placeholder="LIC-…" autocomplete="off" autocapitalize="none" spellcheck="false" minlength="47" maxlength="47" pattern="LIC-[A-Za-z0-9_\-]{43}" aria-describedby="key-hint" required disabled>
+                <p id="key-hint" class="field-hint">полный ключ, полученный от администратора</p>
+              </div>
+              <div class="field">
+                <label for="hwid">отпечаток устройства <span>HWID</span></label>
+                <input id="hwid" name="hwid" type="text" placeholder="стабильный идентификатор устройства" autocomplete="off" autocapitalize="none" spellcheck="false" minlength="16" maxlength="128" pattern="[A-Za-z0-9._:\-]{16,128}" aria-describedby="hwid-hint" required disabled>
+                <p id="hwid-hint" class="field-hint">16–128 символов: латиница, цифры, точка, дефис, _ и :</p>
+              </div>
+              <button id="activate" class="button button-primary" type="submit" disabled>
+                <span id="activate-label">проверка…</span><span class="button-arrow" aria-hidden="true">↗</span>
+              </button>
+              <p class="form-note">браузер не считывает оборудование: HWID передаётся вами или отдельным клиентом.</p>
+            </form>
+
+            <section id="license-session" class="session" aria-label="Активная лицензия" hidden>
+              <div class="success-badge"><span aria-hidden="true">✓</span> подтверждена сервером</div>
+              <dl>
+                <div><dt>идентификатор лицензии</dt><dd id="session-id" class="mono"></dd></div>
+                <div><dt>лицензия действует до</dt><dd id="license-expires"></dd></div>
+                <div><dt>сессия действует до</dt><dd id="session-expires"></dd></div>
+              </dl>
+              <div class="session-actions">
+                <button id="refresh" class="button button-primary" type="button">проверить сессию <span aria-hidden="true">↻</span></button>
+                <button id="logout" class="button button-secondary" type="button">выйти</button>
+              </div>
+              <p class="form-note">отзыв лицензии или сброс привязки завершает сессию на сервере.</p>
+            </section>
+            <noscript><p class="feedback">для входа нужен JavaScript.</p></noscript>
+          </section>
+        </div>
+      </main>
+
+      <footer class="footer"><span>LICENSE GATE <span class="footer-version">/ 1.0</span></span><span>отдельный модуль лицензирования</span></footer>
+    </div>
+  </body>
+</html>
