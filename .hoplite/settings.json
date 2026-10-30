@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "ports": { "preview": 3000 },
+  "scripts": {
+    "setup": {
+      "enabled": true,
+      "command": "cd licensing && npm ci --ignore-scripts && npm run configure"
+    },
+    "run": {
+      "enabled": true,
+      "command": "cd licensing && HOST=0.0.0.0 npm start"
+    },
+    "check": {
+      "enabled": true,
+      "command": "cd licensing && npm run check"
+    }
+  }
+}
